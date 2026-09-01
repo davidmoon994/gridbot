@@ -1,0 +1,16 @@
+{
+  "listen_addr": "127.0.0.1:3000",
+  "db_path": "gridbot.db",
+  "exchange": {
+    "quote_asset": "USDT",
+    "paper_initial_balance": 10000,
+    "paper_initial_prices": {
+      "BTCUSDT": 96000,
+      "ETHUSDT": 3400,
+      "SOLUSDT": 210
+    }
+  },
+  "tick_interval_sec": 5,
+  "tls_cert_file": "",
+  "tls_key_file": ""
+}

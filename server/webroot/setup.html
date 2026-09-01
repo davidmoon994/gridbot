@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>初始化管理账户 · GridBot</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#131722; --border:#232a3a; --text:#e6e9ef; --muted:#838ba0;
+    --amber:#e8a33d; --short:#ff6b6b;
+    --sans:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:var(--bg); color:var(--text); font-family:var(--sans);
+    background-image:linear-gradient(var(--border) 1px, transparent 1px),linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size:28px 28px;
+  }
+  .card{
+    width:380px; background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:32px; box-shadow:0 20px 60px rgba(0,0,0,0.4);
+  }
+  .brand{ display:flex; align-items:center; gap:10px; font-weight:700; margin-bottom:6px; letter-spacing:0.3px; }
+  .mark{
+    width:22px; height:22px; border-radius:4px;
+    background:linear-gradient(var(--amber) 1px, transparent 1px) 0 0/8px 8px, linear-gradient(90deg, var(--amber) 1px, transparent 1px) 0 0/8px 8px, #171c29;
+    border:1px solid #7a5c28;
+  }
+  .sub{ color:var(--muted); font-size:13px; margin-bottom:20px; }
+  label{ font-size:12px; color:var(--muted); display:block; margin:14px 0 6px; }
+  input{
+    width:100%; background:#0e131d; border:1px solid var(--border); color:var(--text);
+    padding:10px 12px; border-radius:6px; font-family:var(--mono); font-size:14px;
+  }
+  button{
+    width:100%; margin-top:20px; padding:11px; border:none; border-radius:6px;
+    background:var(--amber); color:#1a1204; font-weight:700; font-size:14px; cursor:pointer;
+  }
+  button:hover{ filter:brightness(1.08); }
+  .err{ color:var(--short); font-size:13px; margin-top:12px; min-height:16px; }
+  .hint{ font-size:12px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand"><span class="mark"></span> GRIDBOT 初始化</div>
+  <div class="sub">首次使用，请创建管理账户（仅需创建一次，用于登录控制台）</div>
+  <form id="setupForm">
+    <label>用户名</label>
+    <input name="username" autocomplete="username" required />
+    <label>密码</label>
+    <input name="password" type="password" autocomplete="new-password" minlength="6" required />
+    <div class="hint">至少6位，请妥善保管——本地保存，忘记后需要直接清空数据库重新初始化</div>
+    <div class="err" id="err"></div>
+    <button type="submit">创建账户并登录</button>
+  </form>
+</div>
+<script>
+async function checkStatus(){
+  const res = await fetch('/api/auth/status');
+  const data = await res.json();
+  if(data.has_account){ location.href = data.logged_in ? '/' : '/login.html'; }
+}
+checkStatus();
+
+document.getElementById('setupForm').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const errEl = document.getElementById('err');
+  errEl.textContent = '';
+  try{
+    const res = await fetch('/api/auth/setup', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username: fd.get('username'), password: fd.get('password')})
+    });
+    const data = await res.json();
+    if(!res.ok){ errEl.textContent = data.error || '创建失败'; return; }
+    location.href = '/';
+  } catch(e){ errEl.textContent = '网络错误: ' + e.message; }
+});
+</script>
+</body>
+</html>

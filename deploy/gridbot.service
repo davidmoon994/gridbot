@@ -1,0 +1,25 @@
+[Unit]
+Description=GridBot 移动网格自动交易机器人
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 建议用专门创建的非root用户运行，见部署文档
+User=gridbot
+Group=gridbot
+WorkingDirectory=/opt/gridbot
+ExecStart=/opt/gridbot/gridbot -config /opt/gridbot/config.json
+
+# 崩溃后自动重启，无限次重试，每次间隔5秒
+Restart=always
+RestartSec=5
+
+# 基础安全加固：限制进程能访问的系统资源范围
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/gridbot
+
+[Install]
+WantedBy=multi-user.target

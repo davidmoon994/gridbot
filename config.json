@@ -1,0 +1,20 @@
+{
+  "listen_addr": "127.0.0.1:3000",
+  "db_path": "gridbot.db",
+  "exchange": {
+    "type": "paper",
+    "api_key": "",
+    "api_secret": "",
+    "testnet": false,
+    "quote_asset": "USDT",
+    "paper_initial_balance": 10000,
+    "paper_initial_prices": {
+      "BTCUSDT": 96000,
+      "ETHUSDT": 3400,
+      "SOLUSDT": 210,
+  "ETHUSDC": 3400,
+  "BTCUSDC": 96000
+    }
+  },
+  "tick_interval_sec": 5
+}

@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>移动网格 · GridBot 控制台</title>
+<style>
+  :root{
+    --bg: #0b0e14;
+    --panel: #131722;
+    --panel-2: #171c29;
+    --border: #232a3a;
+    --text: #e6e9ef;
+    --muted: #838ba0;
+    --amber: #e8a33d;
+    --amber-dim: #7a5c28;
+    --long: #3ddc97;
+    --short: #ff6b6b;
+    --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  *{ box-sizing:border-box; }
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--sans); font-size:14px;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 28px 28px;
+    background-attachment: fixed;
+  }
+  header{
+    display:flex; align-items:center; gap:14px;
+    padding:14px 22px; border-bottom:1px solid var(--border);
+    background: rgba(11,14,20,0.9); backdrop-filter: blur(6px);
+    position: sticky; top:0; z-index:10;
+  }
+  .brand{ display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:0.3px; }
+  .brand .mark{
+    width:22px; height:22px; border-radius:4px;
+    background:
+      linear-gradient(var(--amber) 1px, transparent 1px) 0 0/8px 8px,
+      linear-gradient(90deg, var(--amber) 1px, transparent 1px) 0 0/8px 8px,
+      var(--panel-2);
+    border:1px solid var(--amber-dim);
+  }
+  header .sep{ flex:1; }
+  .pill{
+    font-family:var(--mono); font-size:12px; color:var(--muted);
+    border:1px solid var(--border); border-radius:20px; padding:4px 10px;
+  }
+  .layout{ display:grid; grid-template-columns: 300px 1fr; gap:0; min-height:calc(100vh - 54px); }
+  .sidebar{ border-right:1px solid var(--border); padding:18px; }
+  .sidebar h3{ font-size:11px; text-transform:uppercase; letter-spacing:1.5px; color:var(--muted); margin:18px 0 8px; }
+  .sidebar h3:first-child{ margin-top:0; }
+  .symbol-item{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:9px 10px; border-radius:6px; cursor:pointer; margin-bottom:4px;
+    border:1px solid transparent;
+  }
+  .symbol-item:hover{ background:var(--panel); }
+  .symbol-item.active{ background:var(--panel-2); border-color:var(--amber-dim); }
+  .symbol-item .name{ font-family:var(--mono); font-weight:600; }
+  .dot{ width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot.on{ background:var(--long); box-shadow:0 0 6px var(--long); }
+  .dot.off{ background:var(--muted); }
+
+  form.create{ display:flex; flex-direction:column; gap:8px; }
+  form.create label{ font-size:11px; color:var(--muted); display:block; margin-bottom:3px; }
+  form.create input, form.create select{
+    width:100%; background:var(--panel); border:1px solid var(--border); color:var(--text);
+    padding:7px 8px; border-radius:5px; font-family:var(--mono); font-size:13px;
+  }
+  .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button{
+    cursor:pointer; border:none; border-radius:6px; padding:9px 12px;
+    font-weight:600; font-size:13px; font-family:var(--sans);
+  }
+  .btn-primary{ background:var(--amber); color:#1a1204; }
+  .btn-primary:hover{ filter:brightness(1.08); }
+  .btn-ghost{ background:transparent; border:1px solid var(--border); color:var(--text); }
+  .btn-danger{ background:transparent; border:1px solid var(--short); color:var(--short); }
+
+  main{ padding:22px; }
+  .empty{ color:var(--muted); padding:60px 0; text-align:center; }
+
+  .stat-row{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:18px; }
+  .stat{
+    background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 14px;
+  }
+  .stat .label{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
+  .stat .value{ font-family:var(--mono); font-size:20px; margin-top:4px; }
+  .value.pos{ color:var(--long); } .value.neg{ color:var(--short); }
+
+  .panels{ display:grid; grid-template-columns: 1.1fr 1fr; gap:16px; }
+  .panel{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .panel h4{ margin:0 0 12px; font-size:12px; text-transform:uppercase; letter-spacing:1.5px; color:var(--muted); }
+
+  .ladder{ display:flex; flex-direction:column-reverse; gap:2px; max-height:520px; overflow-y:auto; }
+  .rung{
+    display:grid; grid-template-columns: 50px 1fr 90px; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:12px; padding:6px 8px; border-radius:5px;
+    border:1px solid transparent;
+  }
+  .rung .idx{ color:var(--muted); text-align:right; }
+  .rung .bar{ height:6px; border-radius:3px; background:var(--border); position:relative; overflow:hidden; }
+  .rung .bar > i{ display:block; height:100%; }
+  .rung.buy .bar > i{ background: var(--long); width:100%; }
+  .rung.sell .bar > i{ background: var(--short); width:100%; }
+  .rung.empty .bar > i{ background: transparent; }
+  .rung .price{ text-align:right; }
+  .rung.center{ border-color:var(--amber); background:rgba(232,163,61,0.08); }
+  .rung.filled{ font-weight:700; }
+  .badge{ font-size:10px; padding:1px 6px; border-radius:10px; border:1px solid var(--border); }
+  .badge.filled{ border-color:var(--amber); color:var(--amber); }
+
+  .log{ display:flex; flex-direction:column; gap:6px; max-height:520px; overflow-y:auto; font-family:var(--mono); font-size:12px; }
+  .log .row{ display:flex; gap:8px; padding:6px 8px; border-radius:5px; border-left:2px solid var(--border); }
+  .log .row .t{ color:var(--muted); white-space:nowrap; }
+  .log .row.grid_filled{ border-left-color:var(--long); }
+  .log .row.take_profit{ border-left-color:var(--amber); }
+  .log .row.recenter{ border-left-color:#7aa2ff; }
+  .log .row.error, .log .row.risk_reject, .log .row.force_close{ border-left-color:var(--short); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="mark"></span> GRIDBOT · 移动网格控制台</div>
+  <div class="pill" id="exchangeName">—</div>
+  <div class="sep"></div>
+  <div class="pill" id="balancePill">余额 —</div>
+  <button class="btn-ghost" id="logoutBtn" style="margin-left:12px; padding:6px 12px; font-size:12px;">退出登录</button>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h3>交易所账号</h3>
+    <div id="exchangeList" style="margin-bottom:10px;"></div>
+    <form class="create" id="bindForm">
+      <div class="grid2">
+        <div>
+          <label>交易所</label>
+          <select name="exchange_type" id="bindExchangeType">
+            <option value="binance_futures">币安合约</option>
+            <option value="binance_spot">币安现货</option>
+            <option value="okx">OKX合约</option>
+            <option value="okx_spot">OKX现货</option>
+          </select>
+        </div>
+        <div>
+          <label>计价货币</label>
+          <input name="quote_asset" placeholder="USDC / USDT" value="USDC" />
+        </div>
+      </div>
+      <div>
+        <label>API Key</label>
+        <input name="api_key" required />
+      </div>
+      <div>
+        <label>API Secret</label>
+        <input name="api_secret" type="password" required />
+      </div>
+      <div id="passphraseField">
+        <label>Passphrase（仅OKX需要）</label>
+        <input name="passphrase" type="password" />
+      </div>
+      <div class="grid2">
+        <div>
+          <label>测试网/模拟盘</label>
+          <select name="testnet"><option value="false">否（实盘）</option><option value="true">是</option></select>
+        </div>
+        <div id="hedgeModeField">
+          <label>双向持仓(neutral模式需要)</label>
+          <select name="hedge_mode"><option value="false">否</option><option value="true">是</option></select>
+        </div>
+      </div>
+      <div class="err" id="bindErr" style="color:var(--short); font-size:12px; min-height:14px;"></div>
+      <button class="btn-primary" type="submit">绑定并启用</button>
+    </form>
+
+    <h3>运行中的网格</h3>
+    <div id="symbolList"><div class="empty" style="padding:10px 0;">暂无</div></div>
+
+    <h3>新建网格策略</h3>
+    <form class="create" id="createForm">
+      <div>
+        <label>交易对</label>
+        <input name="symbol" placeholder="BTCUSDT" required />
+      </div>
+      <div class="grid2">
+        <div>
+          <label>模式</label>
+          <select name="mode" id="gridModeSelect">
+            <option value="long_only">只做多 (long_only)</option>
+            <option value="neutral" id="neutralModeOption">中性双向 (neutral)</option>
+          </select>
+        </div>
+        <div>
+          <label id="leverageLabel">杠杆</label>
+          <input name="leverage" id="leverageInput" type="number" value="3" min="1" max="20" />
+        </div>
+      </div>
+      <div class="hint" id="spotHint" style="display:none; font-size:11px; color:var(--muted); margin:-6px 0 4px;">
+        当前使用现货交易所：不支持做空，已固定为「只做多」、杠杆锁定为1
+      </div>
+      <div class="grid2">
+        <div>
+          <label>网格层数(单侧)</label>
+          <input name="grid_count" type="number" value="8" min="2" max="30" />
+        </div>
+        <div>
+          <label>每格金额(USDT)</label>
+          <input name="per_grid_quote_amount" type="number" value="50" min="12" />
+        </div>
+      </div>
+      <div class="grid2">
+        <div>
+          <label>ATR间距系数</label>
+          <input name="atr_spacing_multiplier" type="number" step="0.1" value="0.6" />
+        </div>
+        <div>
+          <label>重新居中阈值(格)</label>
+          <input name="recenter_threshold_grids" type="number" value="6" />
+        </div>
+      </div>
+      <div>
+        <label>本策略最大总仓位(USDT)</label>
+        <input name="max_total_position_quote" type="number" value="2000" />
+      </div>
+      <button class="btn-primary" type="submit">启动网格</button>
+    </form>
+  </aside>
+
+  <main>
+    <div id="mainContent"><div class="empty">从左侧启动一个网格，或选择一个正在运行的交易对查看详情</div></div>
+  </main>
+</div>
+
+<script>
+let currentSymbol = null;
+let pollTimer = null;
+
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  if(res.status === 401){ location.href = '/login.html'; throw new Error('未登录'); }
+  if(!res.ok){ const e = await res.json().catch(()=>({error:res.statusText})); throw new Error(e.error||res.statusText); }
+  return res.json();
+}
+
+function fmt(n, d=2){ if(n===undefined||n===null||isNaN(n)) return '—'; return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+
+async function refreshStatus(){
+  try{
+    const status = await api('/api/status');
+    document.getElementById('exchangeName').textContent = '交易所: ' + status.exchange;
+    const bal = (status.balances||[])[0];
+    document.getElementById('balancePill').textContent = bal ? `余额 ${fmt(bal.available)} ${bal.asset}` : '余额 —';
+    applySpotUIConstraints(status.exchange || '');
+
+    const grids = await api('/api/grids');
+    const listEl = document.getElementById('symbolList');
+    if(grids.length===0){
+      listEl.innerHTML = '<div class="empty" style="padding:10px 0;">暂无</div>';
+    } else {
+      listEl.innerHTML = grids.map(g => `
+        <div class="symbol-item ${g.symbol===currentSymbol?'active':''}" data-symbol="${g.symbol}">
+          <span class="name"><span class="dot ${g.running?'on':'off'}"></span>${g.symbol}</span>
+          <span style="font-family:var(--mono); color:${g.snapshot.realized_pnl>=0?'var(--long)':'var(--short)'}">${fmt(g.snapshot.realized_pnl)}</span>
+        </div>`).join('');
+      listEl.querySelectorAll('.symbol-item').forEach(el=>{
+        el.addEventListener('click', ()=> selectSymbol(el.dataset.symbol));
+      });
+      if(!currentSymbol && grids.length>0) selectSymbol(grids[0].symbol);
+    }
+  } catch(e){ console.error(e); }
+}
+
+// 现货交易所不支持做空：锁定模式为"只做多"、杠杆固定为1，避免用户配置出
+// 一个在真实交易所必然被拒绝或行为不符预期的组合。
+function applySpotUIConstraints(exchangeId){
+  const isSpot = exchangeId.endsWith('_spot');
+  const modeSelect = document.getElementById('gridModeSelect');
+  const neutralOption = document.getElementById('neutralModeOption');
+  const leverageInput = document.getElementById('leverageInput');
+  const spotHint = document.getElementById('spotHint');
+
+  neutralOption.disabled = isSpot;
+  spotHint.style.display = isSpot ? 'block' : 'none';
+  if(isSpot){
+    if(modeSelect.value === 'neutral') modeSelect.value = 'long_only';
+    leverageInput.value = 1;
+    // 用 readOnly 而不是 disabled：disabled 的表单项提交时浏览器不会带上它的值，
+    // 会导致提交的 leverage 变成 undefined，而 readOnly 既能锁定编辑又能正常提交。
+    leverageInput.readOnly = true;
+    leverageInput.style.opacity = '0.5';
+  } else {
+    leverageInput.readOnly = false;
+    leverageInput.style.opacity = '1';
+  }
+}
+
+function selectSymbol(symbol){
+  currentSymbol = symbol;
+  refreshStatus();
+  renderMain();
+}
+
+async function renderMain(){
+  const mainEl = document.getElementById('mainContent');
+  if(!currentSymbol){
+    mainEl.innerHTML = '<div class="empty">从左侧启动一个网格，或选择一个正在运行的交易对查看详情</div>';
+    return;
+  }
+  let snap, events, ticker;
+  try{
+    [snap, events, ticker] = await Promise.all([
+      api(`/api/grids/${currentSymbol}/snapshot`),
+      api(`/api/grids/${currentSymbol}/events?limit=40`),
+      api(`/api/ticker/${currentSymbol}`),
+    ]);
+  } catch(e){
+    mainEl.innerHTML = `<div class="empty">加载失败: ${e.message}</div>`;
+    return;
+  }
+
+  const levels = (snap.levels||[]).slice().sort((a,b)=>a.index-b.index);
+  const maxAbsIdx = Math.max(1, ...levels.map(l=>Math.abs(l.index)));
+
+  const ladderHTML = levels.map(l=>{
+    const cls = l.status==='empty' ? 'empty' : (l.index<0 ? 'buy':'sell');
+    const filledCls = l.status==='filled' ? 'filled':'';
+    const badge = l.status==='filled' ? '<span class="badge filled">持仓</span>' : (l.status==='order_open' ? '<span class="badge">挂单</span>':'');
+    return `<div class="rung ${cls} ${filledCls}">
+      <span class="idx">${l.index>0?'+':''}${l.index}</span>
+      <span class="bar"><i></i></span>
+      <span class="price">${fmt(l.price,4)} ${badge}</span>
+    </div>`;
+  }).join('');
+
+  const eventsHTML = events.map(e=>`
+    <div class="row ${e.event_type}">
+      <span class="t">${new Date(e.created_at).toLocaleTimeString()}</span>
+      <span>${e.message}</span>
+    </div>`).join('') || '<div class="empty">暂无事件</div>';
+
+  mainEl.innerHTML = `
+    <div class="stat-row">
+      <div class="stat"><div class="label">当前价格</div><div class="value">${fmt(ticker.price,2)}</div></div>
+      <div class="stat"><div class="label">网格中心 (EMA)</div><div class="value">${fmt(snap.center,2)}</div></div>
+      <div class="stat"><div class="label">网格间距</div><div class="value">${fmt(snap.spacing,2)} <span style="font-size:11px;color:var(--muted)">(${fmt(snap.spacing_pct,2)}%)</span></div></div>
+      <div class="stat"><div class="label">已实现盈亏</div><div class="value ${snap.realized_pnl>=0?'pos':'neg'}">${fmt(snap.realized_pnl)}</div></div>
+      <div class="stat"><div class="label">总持仓名义价值</div><div class="value">${fmt(snap.total_position_quote)}</div></div>
+    </div>
+    <div class="panels">
+      <div class="panel">
+        <h4>网格结构 · ${snap.mode==='neutral'?'中性双向':'只做多'} · 重新居中 ${snap.recenter_count} 次</h4>
+        <div class="ladder">${ladderHTML || '<div class="empty">尚未初始化</div>'}</div>
+      </div>
+      <div class="panel">
+        <h4>事件日志</h4>
+        <div class="log">${eventsHTML}</div>
+      </div>
+    </div>
+    <div style="margin-top:14px;">
+      <button class="btn-danger" id="stopBtn">停止该网格</button>
+    </div>
+  `;
+  document.getElementById('stopBtn').addEventListener('click', async ()=>{
+    if(!confirm(`确认停止 ${currentSymbol} 的网格策略？（不会自动撤单或平仓）`)) return;
+    await api(`/api/grids/${currentSymbol}/stop`, {method:'POST'});
+    refreshStatus(); renderMain();
+  });
+}
+
+document.getElementById('createForm').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const payload = Object.fromEntries(fd.entries());
+  ['grid_count','leverage','per_grid_quote_amount','atr_spacing_multiplier','recenter_threshold_grids','max_total_position_quote']
+    .forEach(k=> payload[k] = Number(payload[k]));
+  payload.symbol = payload.symbol.toUpperCase();
+  try{
+    await api('/api/grids', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    currentSymbol = payload.symbol;
+    refreshStatus(); renderMain();
+  } catch(e){ alert('启动失败: ' + e.message); }
+});
+
+refreshStatus();
+setInterval(()=>{ refreshStatus(); renderMain(); }, 3000);
+
+// ---- 交易所账号绑定 ----
+
+async function refreshExchangeList(){
+  try{
+    const data = await api('/api/exchanges');
+    const el = document.getElementById('exchangeList');
+    if(!data.credentials || data.credentials.length===0){
+      el.innerHTML = '<div class="empty" style="padding:6px 0; font-size:12px;">尚未绑定任何交易所，当前使用模拟盘</div>';
+      return;
+    }
+    el.innerHTML = data.credentials.map(c => `
+      <div class="symbol-item" style="cursor:default;">
+        <span class="name">
+          <span class="dot ${c.active?'on':'off'}"></span>
+          ${c.exchange_type==='okx'?'OKX':'币安'} <span style="color:var(--muted); font-weight:400;">${c.api_key_masked}</span>
+        </span>
+        <span style="display:flex; gap:6px;">
+          ${!c.active ? `<button class="btn-ghost activateBtn" data-type="${c.exchange_type}" style="padding:3px 8px; font-size:11px;">启用</button>` : ''}
+          <button class="btn-danger unbindBtn" data-type="${c.exchange_type}" style="padding:3px 8px; font-size:11px;">解绑</button>
+        </span>
+      </div>`).join('');
+    el.querySelectorAll('.unbindBtn').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        if(!confirm('确认解绑？解绑后如果这是当前使用中的交易所，会自动切回模拟盘。')) return;
+        await api(`/api/exchanges/${btn.dataset.type}`, {method:'DELETE'});
+        refreshExchangeList(); refreshStatus();
+      });
+    });
+    el.querySelectorAll('.activateBtn').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        await api(`/api/exchanges/${btn.dataset.type}/activate`, {method:'POST'});
+        refreshExchangeList(); refreshStatus();
+      });
+    });
+  } catch(e){ console.error(e); }
+}
+
+document.getElementById('bindExchangeType').addEventListener('change', (ev)=>{
+  const isOKX = ev.target.value.startsWith('okx');
+  const isSpot = ev.target.value.endsWith('_spot');
+  document.getElementById('passphraseField').style.display = isOKX ? 'block' : 'none';
+  document.getElementById('hedgeModeField').style.display = isSpot ? 'none' : 'block';
+});
+(function(){
+  const val = document.getElementById('bindExchangeType').value;
+  document.getElementById('passphraseField').style.display = val.startsWith('okx') ? 'block' : 'none';
+  document.getElementById('hedgeModeField').style.display = val.endsWith('_spot') ? 'none' : 'block';
+})();
+
+document.getElementById('bindForm').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const payload = Object.fromEntries(fd.entries());
+  payload.testnet = payload.testnet === 'true';
+  payload.hedge_mode = payload.hedge_mode === 'true';
+  const errEl = document.getElementById('bindErr');
+  errEl.textContent = '';
+  try{
+    const res = await api('/api/exchanges', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    if(res.warning){ errEl.textContent = res.warning; }
+    ev.target.reset();
+    refreshExchangeList(); refreshStatus();
+  } catch(e){ errEl.textContent = '绑定失败: ' + e.message; }
+});
+
+document.getElementById('logoutBtn').addEventListener('click', async ()=>{
+  await fetch('/api/auth/logout', {method:'POST'});
+  location.href = '/login.html';
+});
+
+refreshExchangeList();
+
+</script>
+</body>
+</html>
