@@ -62,6 +62,7 @@ type Manager struct {
 	rawEx      exchange.Exchange
 	guardedEx  *risk.GuardedExchange
 	exchangeID string // 当前交易所标识，如 "paper"/"binance_futures"/"okx"
+	isTestnet  bool   // 当前生效的凭证是测试网还是实盘（同一个exchangeID可能对应两套凭证）
 	quoteAsset string // 当前交易所的计价货币，用于从余额列表里找到"净值"
 
 	mu      sync.RWMutex
@@ -80,8 +81,10 @@ func New(rk *risk.Engine, st *store.Store) *Manager {
 
 // SetExchange 切换当前生效的交易所。会先停止所有正在运行的网格策略，
 // 因为旧交易所上未成交的挂单/仓位在切换后不再被追踪，继续运行可能导致状态不一致。
-// exchangeID 用于展示和持久化标识（如 "paper"/"binance_futures"/"okx"）。
-func (m *Manager) SetExchange(rawEx exchange.Exchange, exchangeID, quoteAsset string) {
+// exchangeID 用于展示和持久化标识（如 "paper"/"binance_futures"/"okx"）；
+// testnet 标记这次切换用的是测试网还是实盘凭证（同一个exchangeID可以有两套独立凭证，
+// 详见 store.ExchangeCredential 的 (exchange_type, testnet) 复合主键设计）。
+func (m *Manager) SetExchange(rawEx exchange.Exchange, exchangeID string, testnet bool, quoteAsset string) {
 	for _, sym := range m.ListSymbols() {
 		m.StopGrid(sym)
 	}
@@ -90,6 +93,7 @@ func (m *Manager) SetExchange(rawEx exchange.Exchange, exchangeID, quoteAsset st
 	defer m.exMu.Unlock()
 	m.rawEx = rawEx
 	m.exchangeID = exchangeID
+	m.isTestnet = testnet
 	m.quoteAsset = quoteAsset
 	m.guardedEx = risk.NewGuardedExchange(rawEx, m.rk, m.buildAccountState(), func(symbol, reason string) {
 		_ = m.st.LogEvent(symbol, "risk_reject", reason, time.Now())
@@ -207,6 +211,13 @@ func (m *Manager) ExchangeID() string {
 	m.exMu.RLock()
 	defer m.exMu.RUnlock()
 	return m.exchangeID
+}
+
+// IsTestnet 判断当前生效的凭证是测试网还是实盘
+func (m *Manager) IsTestnet() bool {
+	m.exMu.RLock()
+	defer m.exMu.RUnlock()
+	return m.isTestnet
 }
 
 // IsSpotExchange 判断当前生效交易所是否为现货交易所（标识以 "_spot" 结尾）

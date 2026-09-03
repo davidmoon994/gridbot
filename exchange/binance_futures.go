@@ -45,11 +45,20 @@ type BinanceFuturesExchange struct {
 	offsetSynced bool
 }
 
-// NewBinanceFuturesExchange 创建 Binance 合约适配器
+// NewBinanceFuturesExchange 创建 Binance 合约适配器。
+//
+// 注意：币安已经把合约测试网整体迁移到了新域名/新登录方式（2026年内发生的变更）：
+//   - 旧：testnet.binancefuture.com，单独注册测试网账号
+//   - 新：demo-fapi.binance.com（REST）/ demo-fstream.binance.com（WebSocket），
+//     登录入口是 https://demo.binance.com，用 GitHub 账号登录后在
+//     Profile → API Management 里创建测试网 API Key。
+//
+// 旧域名已经不再可用（会被重定向或直接连不上），这里用的是新域名。
+// 如果币安未来再次调整，请以 https://developers.binance.com 上的最新文档为准。
 func NewBinanceFuturesExchange(apiKey, apiSecret string, testnet bool) *BinanceFuturesExchange {
 	base := "https://fapi.binance.com"
 	if testnet {
-		base = "https://testnet.binancefuture.com"
+		base = "https://demo-fapi.binance.com"
 	}
 	return &BinanceFuturesExchange{
 		apiKey:     apiKey,

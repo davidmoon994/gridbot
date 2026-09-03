@@ -116,12 +116,12 @@ func warnIfExposedWithoutTLS(listenAddr string, useTLS bool) {
 //
 // 之后运行期间可以随时通过 Web 控制台绑定/解绑/切换，不需要重启进程。
 func startupExchange(mgr *manager.Manager, st *store.Store, cfg config.AppConfig) {
-	activeType, err := st.GetActiveExchange()
+	activeType, activeTestnet, err := st.GetActiveExchange()
 	if err != nil {
 		log.Printf("读取当前生效交易所失败: %v", err)
 	}
 	if activeType != "" && activeType != "paper" {
-		cred, err := st.GetCredential(activeType)
+		cred, err := st.GetCredential(activeType, activeTestnet)
 		if err != nil {
 			log.Printf("读取交易所凭证失败: %v", err)
 		}
@@ -130,7 +130,7 @@ func startupExchange(mgr *manager.Manager, st *store.Store, cfg config.AppConfig
 			if err != nil {
 				log.Printf("恢复交易所 %s 连接失败，退回模拟盘: %v", activeType, err)
 			} else {
-				mgr.SetExchange(ex, activeType, cred.QuoteAsset)
+				mgr.SetExchange(ex, activeType, activeTestnet, cred.QuoteAsset)
 				return
 			}
 		}
@@ -139,7 +139,7 @@ func startupExchange(mgr *manager.Manager, st *store.Store, cfg config.AppConfig
 	// 退化为模拟盘
 	paperEx := exchange.NewPaperExchange(cfg.Exchange.PaperInitialPrices, cfg.Exchange.QuoteAsset, cfg.Exchange.PaperInitialBalance)
 	paperEx.StartAutoTick(2 * time.Second)
-	mgr.SetExchange(paperEx, "paper", cfg.Exchange.QuoteAsset)
+	mgr.SetExchange(paperEx, "paper", false, cfg.Exchange.QuoteAsset)
 }
 
 func restoreGrids(mgr *manager.Manager, st *store.Store, defaultInterval time.Duration) {

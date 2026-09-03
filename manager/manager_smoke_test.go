@@ -40,7 +40,7 @@ func TestCircuitBreakerTriggersOnExtremeMove(t *testing.T) {
 	rk := risk.NewEngine(limits)
 
 	mgr := New(rk, st)
-	mgr.SetExchange(paperEx, "paper", "USDT")
+	mgr.SetExchange(paperEx, "paper", false, "USDT")
 
 	cfg := strategy.Config{
 		Symbol: "TESTUSDT", GridCount: 4, EMAPeriod: 20, ATRPeriod: 14,
@@ -75,7 +75,7 @@ func TestAutoPauseOnConsecutiveErrors(t *testing.T) {
 
 	rk := risk.NewEngine(risk.DefaultLimits())
 	mgr := New(rk, st)
-	mgr.SetExchange(paperEx, "paper", "USDT")
+	mgr.SetExchange(paperEx, "paper", false, "USDT")
 
 	cfg := strategy.Config{
 		Symbol: "BADSYMBOL", GridCount: 4, EMAPeriod: 20, ATRPeriod: 14,
@@ -126,7 +126,7 @@ func TestForceCloseActuallyClosesPosition(t *testing.T) {
 	rk := risk.NewEngine(limits)
 
 	mgr := New(rk, st)
-	mgr.SetExchange(paperEx, "paper", "USDT")
+	mgr.SetExchange(paperEx, "paper", false, "USDT")
 
 	// 网格间距调宽（2%~5%），配合下面的小幅价格步进，确保每次价格变动
 	// 只穿越一层网格，不会一次性触发模拟盘同时撮合多个挂单（模拟盘的撮合
@@ -200,7 +200,7 @@ func TestSpotRejectsNeutralMode(t *testing.T) {
 	// 构造一个 Name() 返回 "binance_spot" 的现货交易所实例，模拟用户绑定了现货账户。
 	// 这里不会真正发起网络请求——StartGrid 的校验发生在任何交易所调用之前。
 	spotEx := exchange.NewBinanceSpotExchange("dummy_key", "dummy_secret", true)
-	mgr.SetExchange(spotEx, spotEx.Name(), "USDC")
+	mgr.SetExchange(spotEx, spotEx.Name(), true, "USDC")
 
 	if !mgr.IsSpotExchange() {
 		t.Fatalf("期望 IsSpotExchange()=true，实际=false（exchangeID=%s）", mgr.ExchangeID())

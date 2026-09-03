@@ -262,6 +262,7 @@ func (s *Server) handleListExchanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	activeType := s.mgr.ExchangeID()
+	activeTestnet := s.mgr.IsTestnet()
 	out := make([]maskedCredential, 0, len(creds))
 	for _, c := range creds {
 		out = append(out, maskedCredential{
@@ -270,11 +271,12 @@ func (s *Server) handleListExchanges(w http.ResponseWriter, r *http.Request) {
 			QuoteAsset:   c.QuoteAsset,
 			Testnet:      c.Testnet,
 			HedgeMode:    c.HedgeMode,
-			Active:       c.ExchangeType == activeType,
+			Active:       c.ExchangeType == activeType && c.Testnet == activeTestnet,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"current_exchange": activeType,
+		"current_testnet":  activeTestnet,
 		"supported_types":  exfactory.SupportedExchangeTypes,
 		"credentials":      out,
 	})
@@ -294,6 +296,10 @@ type bindExchangeRequest struct {
 // 并立即尝试连接、切换为当前生效交易所（相当于"绑定即启用"）。
 // 如果连接测试失败（比如 Key 填错了），凭证仍会保存，但不会切换过去，
 // 便于用户排查问题后重新激活，而不用重新输入一遍。
+//
+// 测试网和实盘各自独立保存一份（唯一键是 exchange_type + testnet 的组合），
+// 绑定测试网凭证不会覆盖已经绑定好的实盘凭证，之后可以用 handleActivateExchange
+// 在两者之间一键切换，不需要重新输入 Key。
 func (s *Server) handleBindExchange(w http.ResponseWriter, r *http.Request) {
 	var req bindExchangeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -341,36 +347,44 @@ func (s *Server) handleBindExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mgr.SetExchange(ex, req.ExchangeType, req.QuoteAsset)
-	_ = s.mgr.Store().SetActiveExchange(req.ExchangeType)
+	s.mgr.SetExchange(ex, req.ExchangeType, req.Testnet, req.QuoteAsset)
+	_ = s.mgr.Store().SetActiveExchange(req.ExchangeType, req.Testnet)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleUnbindExchange 解绑某个交易所：删除保存的凭证；如果当前正在使用它，
-// 自动退回模拟盘（不会自动撤单/平仓，请解绑前自行确认没有未处理的仓位）。
+// handleUnbindExchange 解绑某个交易所（测试网/实盘分别解绑）：删除保存的凭证；
+// 如果当前正在使用它，自动退回模拟盘（不会自动撤单/平仓，请解绑前自行确认没有未处理的仓位）。
 func (s *Server) handleUnbindExchange(w http.ResponseWriter, r *http.Request) {
 	exType := r.PathValue("type")
-	if err := s.mgr.Store().DeleteCredential(exType); err != nil {
+	testnet := r.URL.Query().Get("testnet") == "true"
+	if err := s.mgr.Store().DeleteCredential(exType, testnet); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if s.mgr.ExchangeID() == exType {
+	if s.mgr.ExchangeID() == exType && s.mgr.IsTestnet() == testnet {
 		fallbackToPaper(s.mgr)
-		_ = s.mgr.Store().SetActiveExchange("paper")
+		_ = s.mgr.Store().SetActiveExchange("paper", false)
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleActivateExchange 切换到某个此前已经绑定过的交易所（不需要重新输入 Key）
+// handleActivateExchange 切换到某个此前已经绑定过的交易所（不需要重新输入 Key）。
+// testnet 查询参数决定激活的是测试网那份凭证还是实盘那份——这就是"控制台一键切换
+// 测试网/实盘"的核心：两份凭证一直都保存着，这里只是换一下 Manager 当前指向哪一份。
 func (s *Server) handleActivateExchange(w http.ResponseWriter, r *http.Request) {
 	exType := r.PathValue("type")
-	cred, err := s.mgr.Store().GetCredential(exType)
+	testnet := r.URL.Query().Get("testnet") == "true"
+	cred, err := s.mgr.Store().GetCredential(exType, testnet)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if cred == nil {
-		writeError(w, http.StatusNotFound, "尚未绑定该交易所，请先绑定")
+		mode := "实盘"
+		if testnet {
+			mode = "测试网"
+		}
+		writeError(w, http.StatusNotFound, "尚未绑定该交易所的"+mode+"凭证，请先绑定")
 		return
 	}
 	ex, err := exfactory.Build(*cred)
@@ -378,8 +392,8 @@ func (s *Server) handleActivateExchange(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.mgr.SetExchange(ex, exType, cred.QuoteAsset)
-	_ = s.mgr.Store().SetActiveExchange(exType)
+	s.mgr.SetExchange(ex, exType, testnet, cred.QuoteAsset)
+	_ = s.mgr.Store().SetActiveExchange(exType, testnet)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -393,7 +407,7 @@ func fallbackToPaper(mgr *manager.Manager) {
 	}
 	paperEx := exchange.NewPaperExchange(defaultPrices, "USDT", 10000)
 	paperEx.StartAutoTick(2 * time.Second)
-	mgr.SetExchange(paperEx, "paper", "USDT")
+	mgr.SetExchange(paperEx, "paper", false, "USDT")
 }
 
 // ---- 网格与行情 handler ----
@@ -408,6 +422,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"exchange": s.mgr.ExchangeID(),
+		"testnet":  s.mgr.IsTestnet(),
 		"balances": balances,
 		"symbols":  s.mgr.ListSymbols(),
 	})

@@ -291,7 +291,55 @@ OKX 现货和合约的签名方式、账户/交易接口结构高度相似，没
 （比如最小名义价值过滤器，现货较新版本叫 `NOTIONAL`，合约是 `MIN_NOTIONAL`），
 没有 OKX 那样能直接复用大部分代码的条件，分开实现更清晰。
 
-## 11. 后续可扩展方向
+## 11. 测试网/实盘一键切换（2026-09 新增）
+
+### 11.1 问题：原先测试网和实盘共用一个槽位
+
+最初的设计里，`exchange_credentials` 表以 `exchange_type` 作为唯一主键——同一个
+交易所类型（比如 `binance_futures`）不管是测试网还是实盘凭证，都存在同一行里，
+绑定一个会直接覆盖另一个。这意味着"从测试网切到实盘"实际上是"删掉测试网凭证、
+重新填一遍实盘凭证"，跟"一键切换"完全不是一回事。
+
+### 11.2 修复：(exchange_type, testnet) 复合主键，两者独立存储
+
+`exchange_credentials` 表改成复合主键 `(exchange_type, testnet)`，测试网和实盘
+各自独立占一行，互不覆盖。`active_exchange` 表同步加上 `testnet` 列，记录"当前
+生效的到底是哪一个"，重启后能精确恢复。
+
+对应的 Store 方法（`SaveCredential`/`GetCredential`/`DeleteCredential`）全部
+加上 `testnet` 维度；`Manager` 新增 `IsTestnet()` 方法和内部 `isTestnet` 字段，
+`SetExchange` 签名也加了这个参数。
+
+现在的使用方式：分别绑定一次测试网 Key 和一次实盘 Key（两次"绑定并启用"操作，
+`testnet` 选项不同），之后要切换只需要点已绑定列表里的"启用"按钮
+（对应 `POST /api/exchanges/{type}/activate?testnet=true|false`），
+不需要重新输入任何 Key。
+
+### 11.3 旧数据库的自动迁移
+
+已经在跑的实例（`gridbot.db` 里还是旧的单列主键表结构）不需要手动处理——
+`store.migrate()` 里新增的 `migrateExchangeCredentialsSchema()` 会在启动时
+自动检测表结构（通过读取 `sqlite_master` 里存的建表语句判断新旧schema），
+发现是旧schema就自动做一次"改名旧表→建新表→搬数据→删旧表"的迁移，
+原有的凭证数据（不管之前存的是测试网还是实盘）都会保留，不会丢失。
+`active_exchange` 表同理，用 `ALTER TABLE ... ADD COLUMN` 补齐缺失的 `testnet` 列。
+
+已经在白盒测试中验证过：手工构造一个旧schema的数据库、插入一条实盘凭证，
+用新代码启动后凭证被正确保留和识别，之后能正常绑定第二套（测试网）凭证并
+在两者间来回切换，不影响另一套的存在。
+
+### 11.4 币安合约测试网域名变更（与本次改动一并修复）
+
+币安在这次改动前后的一段时间里把合约测试网整体迁移了：
+
+- 旧：`testnet.binancefuture.com`，单独注册测试网账号
+- 新：`demo-fapi.binance.com`（REST），登录入口 `https://demo.binance.com`，
+  用 GitHub 账号登录后创建 API Key
+
+`exchange/binance_futures.go` 里硬编码的测试网域名已经同步更新为新地址。
+现货测试网域名（`testnet.binance.vision`）没有变化，不受影响。
+
+## 12. 后续可扩展方向
 
 - 补全 Binance/OKX 等真实交易所适配器的 REST 调用；
 - 强平保护自动下达市价平仓单（当前只记录事件，出于安全考虑默认不自动执行）；

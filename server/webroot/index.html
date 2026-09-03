@@ -252,7 +252,8 @@ function fmt(n, d=2){ if(n===undefined||n===null||isNaN(n)) return '—'; return
 async function refreshStatus(){
   try{
     const status = await api('/api/status');
-    document.getElementById('exchangeName').textContent = '交易所: ' + status.exchange;
+    const modeLabel = status.exchange === 'paper' ? '' : (status.testnet ? '（测试网）' : '（实盘）');
+    document.getElementById('exchangeName').textContent = '交易所: ' + status.exchange + modeLabel;
     const bal = (status.balances||[])[0];
     document.getElementById('balancePill').textContent = bal ? `余额 ${fmt(bal.available)} ${bal.asset}` : '余额 —';
     applySpotUIConstraints(status.exchange || '');
@@ -399,27 +400,36 @@ async function refreshExchangeList(){
       el.innerHTML = '<div class="empty" style="padding:6px 0; font-size:12px;">尚未绑定任何交易所，当前使用模拟盘</div>';
       return;
     }
-    el.innerHTML = data.credentials.map(c => `
+    const typeNames = {binance_futures:'币安合约', binance_spot:'币安现货', okx:'OKX合约', okx_spot:'OKX现货'};
+    // 同一个交易所类型可能有"测试网"和"实盘"两条独立记录，按类型分组后测试网排前面，方便对照
+    const sorted = data.credentials.slice().sort((a,b)=>{
+      if(a.exchange_type !== b.exchange_type) return a.exchange_type.localeCompare(b.exchange_type);
+      return (b.testnet?1:0) - (a.testnet?1:0);
+    });
+    el.innerHTML = sorted.map(c => `
       <div class="symbol-item" style="cursor:default;">
         <span class="name">
           <span class="dot ${c.active?'on':'off'}"></span>
-          ${c.exchange_type==='okx'?'OKX':'币安'} <span style="color:var(--muted); font-weight:400;">${c.api_key_masked}</span>
+          ${typeNames[c.exchange_type]||c.exchange_type}
+          <span class="badge ${c.testnet?'':'filled'}" style="margin-left:4px;">${c.testnet?'测试网':'实盘'}</span>
+          <span style="color:var(--muted); font-weight:400; margin-left:4px;">${c.api_key_masked}</span>
         </span>
         <span style="display:flex; gap:6px;">
-          ${!c.active ? `<button class="btn-ghost activateBtn" data-type="${c.exchange_type}" style="padding:3px 8px; font-size:11px;">启用</button>` : ''}
-          <button class="btn-danger unbindBtn" data-type="${c.exchange_type}" style="padding:3px 8px; font-size:11px;">解绑</button>
+          ${!c.active ? `<button class="btn-ghost activateBtn" data-type="${c.exchange_type}" data-testnet="${c.testnet}" style="padding:3px 8px; font-size:11px;">启用</button>` : ''}
+          <button class="btn-danger unbindBtn" data-type="${c.exchange_type}" data-testnet="${c.testnet}" style="padding:3px 8px; font-size:11px;">解绑</button>
         </span>
       </div>`).join('');
     el.querySelectorAll('.unbindBtn').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
-        if(!confirm('确认解绑？解绑后如果这是当前使用中的交易所，会自动切回模拟盘。')) return;
-        await api(`/api/exchanges/${btn.dataset.type}`, {method:'DELETE'});
+        const mode = btn.dataset.testnet==='true' ? '测试网' : '实盘';
+        if(!confirm(`确认解绑${typeNames[btn.dataset.type]||btn.dataset.type}的${mode}凭证？解绑后如果这是当前使用中的交易所，会自动切回模拟盘。`)) return;
+        await api(`/api/exchanges/${btn.dataset.type}?testnet=${btn.dataset.testnet}`, {method:'DELETE'});
         refreshExchangeList(); refreshStatus();
       });
     });
     el.querySelectorAll('.activateBtn').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
-        await api(`/api/exchanges/${btn.dataset.type}/activate`, {method:'POST'});
+        await api(`/api/exchanges/${btn.dataset.type}/activate?testnet=${btn.dataset.testnet}`, {method:'POST'});
         refreshExchangeList(); refreshStatus();
       });
     });
