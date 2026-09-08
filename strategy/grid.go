@@ -10,12 +10,28 @@ package strategy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"time"
 
 	"gridbot/exchange"
 )
+
+// randomInstanceID 生成一个6位十六进制的随机短串，用于区分不同次启动的
+// Engine 实例，混入 ClientOrderID 防止重启后订单ID撞车（见 Engine.instanceID 注释）。
+// 用 crypto/rand 而不是 math/rand：不需要密码学强度，只是图个不依赖手动播种、
+// 不会因为两次启动时间太近而生成相同序列的方便。
+func randomInstanceID() string {
+	b := make([]byte, 3)
+	if _, err := rand.Read(b); err != nil {
+		// 极小概率的兜底：读随机数失败就退化用当前时间纳秒的低位，
+		// 依然能起到"跟上次大概率不一样"的效果。
+		return fmt.Sprintf("%06x", time.Now().UnixNano()&0xffffff)
+	}
+	return hex.EncodeToString(b)
+}
 
 // Mode 网格模式
 type Mode string
@@ -153,14 +169,25 @@ type Engine struct {
 	realizedPnL   float64
 	seq           int64
 
+	// instanceID 是每次创建 Engine 时生成的一个随机短串，混入订单的
+	// ClientOrderID 里，确保"重启程序"不会导致订单ID撞车。
+	//
+	// 背景：seq 只存在内存里，每次程序重启（或重新启动这个网格）都会
+	// 从0重新计数；但交易所（尤其币安）会在一段时间内记住用过的
+	// ClientOrderID，不允许重复。如果没有这个随机成分，频繁重启会导致
+	// "ClientOrderId is duplicated"这类挂单失败，且很难排查，因为
+	// 每次生成的ID字符串在数值上确实和之前用过的一模一样。
+	instanceID string
+
 	initialized bool
 }
 
 // NewEngine 创建一个新的移动网格引擎
 func NewEngine(cfg Config) *Engine {
 	return &Engine{
-		cfg:    cfg,
-		levels: map[int]*Level{},
+		cfg:        cfg,
+		levels:     map[int]*Level{},
+		instanceID: randomInstanceID(),
 	}
 }
 
@@ -263,7 +290,7 @@ func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, c
 				continue
 			}
 			e.seq++
-			clientID := fmt.Sprintf("%s-B-%d-%d", e.cfg.Symbol, i, e.seq)
+			clientID := fmt.Sprintf("%s-B-%d-%s-%d", e.cfg.Symbol, i, e.instanceID, e.seq)
 			order, err := ex.PlaceOrder(ctx, exchange.OrderRequest{
 				Symbol:        e.cfg.Symbol,
 				Side:          exchange.SideBuy,
@@ -289,7 +316,7 @@ func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, c
 				continue
 			}
 			e.seq++
-			clientID := fmt.Sprintf("%s-S-%d-%d", e.cfg.Symbol, i, e.seq)
+			clientID := fmt.Sprintf("%s-S-%d-%s-%d", e.cfg.Symbol, i, e.instanceID, e.seq)
 			order, err := ex.PlaceOrder(ctx, exchange.OrderRequest{
 				Symbol:        e.cfg.Symbol,
 				Side:          exchange.SideSell,
@@ -482,7 +509,7 @@ func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *L
 
 func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side exchange.Side, posSide exchange.PositionSide, price, qty float64, targetLvl *Level) {
 	e.seq++
-	clientID := fmt.Sprintf("%s-TP-%d-%d", e.cfg.Symbol, targetLvl.Index, e.seq)
+	clientID := fmt.Sprintf("%s-TP-%d-%s-%d", e.cfg.Symbol, targetLvl.Index, e.instanceID, e.seq)
 	order, err := ex.PlaceOrder(ctx, exchange.OrderRequest{
 		Symbol:        e.cfg.Symbol,
 		Side:          side,

@@ -420,11 +420,29 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// balancesSummary 专门给顶部的余额标签用：合约账户重点关心 USDC/USDT
+	// 这两种计价货币，两个都尽量显示（而不是像之前那样只显示配置的
+	// quote_asset 那一个，或者盲目取数组第一项，导致另一种明明有余额却看不到）。
+	// 完整的持仓明细见下方 balances 字段——现货账户界面会把这个字段完整
+	// 展示出来（所有持有的币种），不只是 USDC/USDT。
+	summaryAssets := []string{"USDC", "USDT"}
+	var summary []exchange.Balance
+	for _, want := range summaryAssets {
+		for _, b := range balances {
+			if b.Asset == want {
+				summary = append(summary, b)
+				break
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"exchange": s.mgr.ExchangeID(),
-		"testnet":  s.mgr.IsTestnet(),
-		"balances": balances,
-		"symbols":  s.mgr.ListSymbols(),
+		"exchange":         s.mgr.ExchangeID(),
+		"testnet":          s.mgr.IsTestnet(),
+		"balances":         balances,
+		"balances_summary": summary,
+		"symbols":          s.mgr.ListSymbols(),
 	})
 }
 

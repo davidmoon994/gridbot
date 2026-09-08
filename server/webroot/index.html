@@ -134,6 +134,9 @@
 
 <div class="layout">
   <aside class="sidebar">
+    <h3>总余额</h3>
+    <div id="walletBalances" style="margin-bottom:14px;"><div class="empty" style="padding:6px 0; font-size:12px;">—</div></div>
+
     <h3>交易所账号</h3>
     <div id="exchangeList" style="margin-bottom:10px;"></div>
     <form class="create" id="bindForm">
@@ -249,13 +252,34 @@ async function api(path, opts){
 
 function fmt(n, d=2){ if(n===undefined||n===null||isNaN(n)) return '—'; return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); }
 
+// 展示账户持有的全部币种（不只是 USDC/USDT）——现货账户尤其需要看到完整持仓，
+// 合约账户里除了 USDC/USDT 之外通常还会有已实现盈亏累计等资产，一并列出。
+function renderWalletBalances(balances){
+  const el = document.getElementById('walletBalances');
+  const held = balances.filter(b => b.total > 0 || b.available > 0);
+  if(held.length === 0){
+    el.innerHTML = '<div class="empty" style="padding:6px 0; font-size:12px;">暂无余额</div>';
+    return;
+  }
+  const sorted = held.slice().sort((a,b)=> (b.total||0) - (a.total||0));
+  el.innerHTML = sorted.map(b => `
+    <div style="display:flex; justify-content:space-between; padding:4px 2px; font-family:var(--mono); font-size:12px;">
+      <span style="color:var(--muted);">${b.asset}</span>
+      <span>${fmt(b.total, b.total < 1 ? 6 : 2)}</span>
+    </div>`).join('');
+}
+
 async function refreshStatus(){
   try{
     const status = await api('/api/status');
     const modeLabel = status.exchange === 'paper' ? '' : (status.testnet ? '（测试网）' : '（实盘）');
     document.getElementById('exchangeName').textContent = '交易所: ' + status.exchange + modeLabel;
-    const bal = (status.balances||[])[0];
-    document.getElementById('balancePill').textContent = bal ? `余额 ${fmt(bal.available)} ${bal.asset}` : '余额 —';
+    const summary = status.balances_summary || [];
+    const balText = summary.length
+      ? summary.map(b => `${b.asset} ${fmt(b.available)}`).join(' · ')
+      : '—';
+    document.getElementById('balancePill').textContent = '可用余额 ' + balText;
+    renderWalletBalances(status.balances || []);
     applySpotUIConstraints(status.exchange || '');
 
     const grids = await api('/api/grids');
