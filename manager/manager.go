@@ -430,13 +430,18 @@ func (m *Manager) tick(ctx context.Context, t *Trader) {
 				closeSide = exchange.SideBuy
 			}
 			_, closeErr := guardedEx.PlaceOrder(ctx, exchange.OrderRequest{
-				Symbol:        t.Symbol,
-				Side:          closeSide,
-				PositionSide:  p.PositionSide,
-				Type:          exchange.OrderTypeMarket,
-				Quantity:      p.Quantity,
-				ReduceOnly:    true,
-				ClientOrderID: fmt.Sprintf("%s-FORCECLOSE-%d", t.Symbol, time.Now().UnixNano()),
+				Symbol:       t.Symbol,
+				Side:         closeSide,
+				PositionSide: p.PositionSide,
+				Type:         exchange.OrderTypeMarket,
+				Quantity:     p.Quantity,
+				ReduceOnly:   true,
+				// 用毫秒级时间戳（13位）而不是纳秒级（19位）：币安要求
+				// ClientOrderID总长度不超过36个字符，"symbol-FORCECLOSE-纳秒时间戳"
+				// 这种拼法对长一点的交易对名称很容易超限（之前线上就是因为超限
+				// 导致强平下单直接失败，风控保护形同虚设），换成更短的标签
+				// 和毫秒精度，留出安全余量。
+				ClientOrderID: fmt.Sprintf("%s-FC-%d", t.Symbol, time.Now().UnixMilli()),
 			})
 			if closeErr != nil {
 				_ = m.st.LogEvent(t.Symbol, "error", "强平下单失败: "+closeErr.Error(), time.Now())
