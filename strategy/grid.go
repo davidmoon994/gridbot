@@ -257,11 +257,84 @@ func (e *Engine) Initialize(ctx context.Context, ex exchange.Exchange) ([]Event,
 			center, spacing, spacing/center*100, e.cfg.GridCount*2),
 	})
 
+	// 核对交易所侧是否存在这个symbol的真实遗留持仓——网格引擎自己的成交记账
+	// 只存在内存里，程序每次重启都会从空白状态开始；如果重启前有仓位还没
+	// 平掉（比如上一次强平下单失败、或者进程被意外杀掉），不主动核对的话，
+	// 软件会误以为自己一无所有，那笔真实仓位就变成了脱离监管的"孤儿仓位"，
+	// 既不会被继续追踪浮盈回撤，也不会有对应的止盈单在等着它。
+	events = append(events, e.reconcileExistingPositions(ctx, ex)...)
+
 	placeEvents, err := e.placeMissingOrders(ctx, ex, ticker.Price)
 	if err != nil {
 		return events, err
 	}
 	return append(events, placeEvents...), nil
+}
+
+// reconcileExistingPositions 在网格刚初始化、所有层都还是空白状态时，
+// 主动查询交易所这个symbol当前的真实持仓，如果发现有遗留仓位，
+// 把它"认领"到最接近的网格层上（多头只会认领到index<0的层，
+// 空头只会认领到index>0的层），并立刻为它挂出对应的止盈单——
+// 而不是放任这笔仓位在软件的记账里凭空消失。
+//
+// 现货没有交易所原生"持仓"概念可查（见 exchange/binance_spot.go 顶部注释），
+// 这里对现货直接跳过；现货重启后的持仓核对是一个更深层的已知限制
+// （需要把网格引擎的运行时状态持久化到数据库才能彻底解决，目前还没做，
+// 见架构文档"后续可扩展方向"）。
+func (e *Engine) reconcileExistingPositions(ctx context.Context, ex exchange.Exchange) []Event {
+	var events []Event
+	if e.cfg.IsSpot() {
+		return events
+	}
+
+	positions, err := ex.GetPositions(ctx, e.cfg.Symbol)
+	if err != nil {
+		events = append(events, Event{Time: time.Now(), Type: "error",
+			Message: fmt.Sprintf("启动时核对交易所真实持仓失败，可能遗漏此前未平的仓位，请自行去交易所确认: %v", err)})
+		return events
+	}
+
+	for _, p := range positions {
+		if p.Quantity <= 0 || p.EntryPrice <= 0 {
+			continue
+		}
+
+		nearestIdx := int(math.Round((p.EntryPrice - e.center) / e.spacing))
+		// 多头持仓必须落在负数层，空头必须落在正数层（网格的方向约定），
+		// 就算按价格算出来的最近层落在了错误的一侧或者中心线上，也要强制扭正。
+		if p.PositionSide == exchange.PositionLong && nearestIdx >= 0 {
+			nearestIdx = -1
+		}
+		if p.PositionSide == exchange.PositionShort && nearestIdx <= 0 {
+			nearestIdx = 1
+		}
+		if nearestIdx < -e.cfg.GridCount {
+			nearestIdx = -e.cfg.GridCount
+		}
+		if nearestIdx > e.cfg.GridCount {
+			nearestIdx = e.cfg.GridCount
+		}
+
+		lvl, ok := e.levels[nearestIdx]
+		if !ok {
+			events = append(events, Event{Time: time.Now(), Type: "error",
+				Message: fmt.Sprintf("发现交易所遗留持仓（%s 数量=%.6f 成本=%.4f），但网格范围内找不到合适的层容纳，请人工确认该仓位",
+					p.PositionSide, p.Quantity, p.EntryPrice)})
+			continue
+		}
+
+		lvl.Status = LevelFilled
+		lvl.FilledQty = p.Quantity
+		lvl.FilledPrice = p.EntryPrice
+		lvl.FilledAt = time.Now()
+
+		events = append(events, Event{Time: time.Now(), Type: "info",
+			Message: fmt.Sprintf("启动时发现交易所遗留持仓：%s 数量=%.6f 成本=%.4f，已接管到 level=%d，将挂出对应止盈单",
+				p.PositionSide, p.Quantity, p.EntryPrice, nearestIdx)})
+
+		events = append(events, e.pairAndPlaceTakeProfit(ctx, ex, lvl, p.Quantity)...)
+	}
+	return events
 }
 
 // placeMissingOrders 为所有状态为 Empty 且"应该有挂单"的层补挂订单：
@@ -452,6 +525,19 @@ func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *L
 	events = append(events, Event{Time: time.Now(), Type: "grid_filled",
 		Message: fmt.Sprintf("网格成交 level=%d price=%.4f qty=%.6f", lvl.Index, lvl.Price, qty)})
 
+	events = append(events, e.pairAndPlaceTakeProfit(ctx, ex, lvl, qty)...)
+	return events
+}
+
+// pairAndPlaceTakeProfit 给一个刚变成"已成交/持仓"状态的层，找到它的配对层
+// （通常是相邻一层），挂出对应的止盈单；如果配对层恰好已经持有反向仓位
+// （说明这笔正好是给已有持仓的平仓单），直接对冲结算已实现盈亏、两层都清空。
+//
+// 从两处调用：正常成交检测走 onLevelFilled；程序重启后核对交易所真实
+// 遗留持仓走 reconcileExistingPositions——两种场景都需要"给持仓层配一个
+// 止盈出口"，逻辑完全一样，抽成一个函数避免重复代码。
+func (e *Engine) pairAndPlaceTakeProfit(ctx context.Context, ex exchange.Exchange, lvl *Level, qty float64) []Event {
+	var events []Event
 	var pairIndex int
 	var side exchange.Side
 	var posSide exchange.PositionSide
@@ -476,9 +562,6 @@ func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *L
 	pairLvl, ok := e.levels[pairIndex]
 	if !ok {
 		// 极端情况：配对层超出当前网格范围（例如网格层数设置过小）。
-		// 直接在"成交价 ± 一个间距"处挂平仓单，但目标状态记录在成交层自身以外的
-		// 一个游离追踪结构中，而不是覆盖 lvl 本身的 Filled 状态——
-		// 简化实现：由风控引擎的回撤保护兜底，此处仅记录警告事件。
 		events = append(events, Event{Time: time.Now(), Type: "error",
 			Message: fmt.Sprintf("level=%d 配对层超出网格范围，建议增大网格层数(GridCount)", lvl.Index)})
 		return events
