@@ -34,6 +34,20 @@ type Limits struct {
 	// 避免峰值本身就很小（比如0.5%）时，微小波动被放大成"回撤过半"的假信号。
 	MinPeakPctForProtection float64
 
+	// MaxLossFromEntryPct 单个持仓允许的最大浮亏，单位：百分比，口径与
+	// AccountState.CurrentUnrealizedPnLPct 一致（已按杠杆折算，例如3倍杠杆下
+	// 价格反向波动5%对应这里的15）。0 表示不启用。
+	//
+	// 这是与"回撤保护"(MaxDrawdownFromPeakPct)互补、而非替代的另一条独立防线：
+	// 回撤保护只在浮盈先摸到过 MinPeakPctForProtection 之后才会生效，对"从开仓起
+	// 就一路阴跌、浮盈从未转正过"的单边趋势完全无效——这恰恰是网格策略最容易被
+	// 打爆的场景（网格越跌越买，买的层越来越多、越套越深，却没有任何机制止损）。
+	// 这里的止损不依赖任何历史峰值，只要当前浮亏触线就强平，兜底所有方向的单边行情。
+	//
+	// 默认值建议见 DefaultLimits 的注释；实盘/测试网请结合自己网格的
+	// GridCount、MaxSpacingPercent、杠杆一起评估，不要直接套用默认值。
+	MaxLossFromEntryPct float64
+
 	// MaxDailyLossQuote 当日最大允许亏损（USDT），触发后暂停新开仓（熔断）
 	MaxDailyLossQuote float64
 
@@ -46,12 +60,22 @@ type Limits struct {
 // DefaultLimits 提供一组保守的默认硬约束，参考 NOFX 文档中的约束设定
 func DefaultLimits() Limits {
 	return Limits{
-		MaxLeverage:                20,
-		MaxPositionQuoteRatio:      0.5,
-		MaxTotalMarginRatio:        0.9,
-		MinOrderQuoteAmount:        12,
-		MaxDrawdownFromPeakPct:     0.5,
-		MinPeakPctForProtection:    1.0, // 浮盈峰值需达到1%才启用回撤保护，过滤微小波动噪音
+		MaxLeverage:             20,
+		MaxPositionQuoteRatio:   0.5,
+		MaxTotalMarginRatio:     0.9,
+		MinOrderQuoteAmount:     12,
+		MaxDrawdownFromPeakPct:  0.5,
+		MinPeakPctForProtection: 1.0, // 浮盈峰值需达到1%才启用回撤保护，过滤微小波动噪音
+		// MaxLossFromEntryPct 默认 15：口径与 CurrentUnrealizedPnLPct 一致（已乘杠杆），
+		// 按本项目默认杠杆 3x 折算，约等于价格从入场点反向波动 ~5% 就止损。
+		// 这个默认值刻意设置得比"网格重新居中"的正常波动范围更宽松一些：
+		// RecenterThresholdGrids(默认6) * MaxSpacingPercent(默认3%) 理论上最大能到 18%，
+		// 但间距通常远小于 MaxSpacingPercent 这个上限，正常的网格内波动、以及触发
+		// recenter 之前的价格游走，都不应该轻易碰到 15% 这条线；一旦碰到，基本可以
+		// 判断为网格间距/参数没吃住的真实单边趋势，应该止损出场而不是继续扛仓。
+		// 如果你调大了杠杆或调宽了网格间距，请按 "杠杆 × 你能接受的价格反向波动百分比"
+		// 重新估算这个值，而不是照抄默认的15。
+		MaxLossFromEntryPct:        15.0,
 		MaxDailyLossQuote:          0,   // 0 表示不启用，需显式配置
 		CircuitBreakerPriceMovePct: 8.0, // 单tick 8% 视为极端行情
 		CircuitBreakerCooldownSec:  600,
@@ -180,6 +204,15 @@ func (e *Engine) Evaluate(intent OrderIntent, state AccountState) Decision {
 // 浮盈从历史峰值回撤超过设定比例。对应 prompt-guide 中提到的
 // "最高收益率"与"盈亏回撤"概念。
 func (e *Engine) ShouldForceClose(state AccountState) (bool, string) {
+	// 绝对止损：不依赖任何历史浮盈峰值，只要当前浮亏达到硬止损线就强平。
+	// 必须放在回撤保护判断之前独立检查——回撤保护那条分支在浮盈从未摸到
+	// MinPeakPctForProtection 时会直接 return false，如果不单独判断这一条，
+	// "开仓后一路阴跌、从没盈利过"的行情会完全绕开所有强平保护。
+	if e.limits.MaxLossFromEntryPct > 0 && state.CurrentUnrealizedPnLPct <= -e.limits.MaxLossFromEntryPct {
+		return true, fmt.Sprintf("浮亏达到 %.2f%%，触及绝对止损线 %.1f%%，触发强制平仓",
+			state.CurrentUnrealizedPnLPct, e.limits.MaxLossFromEntryPct)
+	}
+
 	if state.PeakUnrealizedPnLPct < e.limits.MinPeakPctForProtection {
 		return false, ""
 	}

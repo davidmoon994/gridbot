@@ -129,9 +129,15 @@ type Level struct {
 	Status          LevelStatus `json:"status"`
 	OrderClientID   string      `json:"order_client_id"`
 	ExchangeOrderID string      `json:"exchange_order_id"`
-	FilledQty       float64     `json:"filled_qty"`
-	FilledPrice     float64     `json:"filled_price"`
-	FilledAt        time.Time   `json:"filled_at"`
+	// OrderQty 是挂这笔单时实际提交给交易所的数量（下单请求里的 Quantity）。
+	// 成交后记账/挂止盈单时应优先使用交易所真实返回的成交数量（order.FilledQuantity），
+	// 但那需要一次额外的 GetOrder 查询成功才能拿到；这个字段作为"退化兜底"——
+	// 即便查询失败也能保证止盈单挂出的数量与这笔单子实际提交的数量一致，
+	// 而不是用下单时刻已经不适用的另一个价格重新拍脑袋算一个数字出来。
+	OrderQty    float64   `json:"order_qty"`
+	FilledQty   float64   `json:"filled_qty"`
+	FilledPrice float64   `json:"filled_price"`
+	FilledAt    time.Time `json:"filled_at"`
 }
 
 // Snapshot 用于 Web 界面展示的网格快照（只读）
@@ -346,7 +352,6 @@ func (e *Engine) reconcileExistingPositions(ctx context.Context, ex exchange.Exc
 //     因此这里对 long_only 模式下的裸多层不主动挂空卖单。
 func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, currentPrice float64) ([]Event, error) {
 	var events []Event
-	qty := e.cfg.PerGridQuoteAmount / currentPrice
 
 	for i := -e.cfg.GridCount; i <= e.cfg.GridCount; i++ {
 		if i == 0 {
@@ -356,6 +361,11 @@ func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, c
 		if lvl.Status != LevelEmpty {
 			continue
 		}
+		// 按这一层自己的挂单价计算数量，而不是按调用时刻的市价计算——
+		// 否则同一个 PerGridQuoteAmount 在不同层上买到的名义金额会不一致
+		// （层价格离当前价越远，用市价算出的数量偏差越大），"每格固定名义金额"
+		// 这个参数的语义就名不副实了。
+		qty := e.cfg.PerGridQuoteAmount / lvl.Price
 
 		if i < 0 {
 			// 买入层：只在价格上方时才有意义挂限价买单（价格低于当前价）
@@ -381,6 +391,7 @@ func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, c
 			lvl.Status = LevelOrderOpen
 			lvl.OrderClientID = clientID
 			lvl.ExchangeOrderID = order.ExchangeOrderID
+			lvl.OrderQty = qty
 		} else {
 			if e.cfg.Mode != ModeNeutral {
 				continue // long_only 模式下的裸空层不主动开仓
@@ -407,6 +418,7 @@ func (e *Engine) placeMissingOrders(ctx context.Context, ex exchange.Exchange, c
 			lvl.Status = LevelOrderOpen
 			lvl.OrderClientID = clientID
 			lvl.ExchangeOrderID = order.ExchangeOrderID
+			lvl.OrderQty = qty
 		}
 	}
 	return events, nil
@@ -454,7 +466,7 @@ func (e *Engine) OnTick(ctx context.Context, ex exchange.Exchange) ([]Event, err
 			// 为兼容极端情况，保守地按"已成交"处理，并记录一条警告方便排查。
 			events = append(events, Event{Time: time.Now(), Type: "error",
 				Message: fmt.Sprintf("level=%d 缺少交易所订单ID，按已成交处理（请检查是否为异常数据）", lvl.Index)})
-			filledEvents := e.onLevelFilled(ctx, ex, lvl, ticker.Price)
+			filledEvents := e.onLevelFilled(ctx, ex, lvl, nil)
 			events = append(events, filledEvents...)
 			continue
 		}
@@ -469,7 +481,7 @@ func (e *Engine) OnTick(ctx context.Context, ex exchange.Exchange) ([]Event, err
 
 		switch order.Status {
 		case exchange.OrderStatusFilled:
-			filledEvents := e.onLevelFilled(ctx, ex, lvl, ticker.Price)
+			filledEvents := e.onLevelFilled(ctx, ex, lvl, order)
 			events = append(events, filledEvents...)
 		case exchange.OrderStatusCanceled, exchange.OrderStatusRejected:
 			// 被撤销/被拒绝：这一层重新变回空层，等待下一轮 placeMissingOrders 重新挂单，
@@ -496,7 +508,15 @@ func (e *Engine) OnTick(ctx context.Context, ex exchange.Exchange) ([]Event, err
 		}
 	}
 
-	// 3. 补齐缺失挂单
+	// 3. 兜底检查：所有"已成交/持仓中"的层是否都有一个正在挂着的止盈单。
+	// 覆盖两种此前会导致仓位"裸奔"的场景：
+	//   a) recenter 撤销了旧止盈单、把持仓迁移到新网格后，没有为其重新挂出止盈单；
+	//   b) 上一次 placeTakeProfit 因为网络错误/数量或精度不合法等原因下单失败，
+	//      之前是静默丢弃、没有任何重试路径。
+	// 每个 tick 都跑一遍，天然具备重试能力；已有正在挂着的止盈单的层会被跳过，不会重复下单。
+	events = append(events, e.ensureTakeProfits(ctx, ex)...)
+
+	// 4. 补齐缺失挂单
 	placeEvents, err := e.placeMissingOrders(ctx, ex, ticker.Price)
 	if err != nil {
 		return events, err
@@ -511,19 +531,43 @@ func (e *Engine) OnTick(ctx context.Context, ex exchange.Exchange) ([]Event, err
 //   - 卖单成交（开空，仅neutral模式）：标记该层为 Filled，并在下一层（index-1）挂出买单作为止盈（买回平空）
 //   - 若某层原本是"止盈单"性质（即对侧持仓的平仓单），成交后应将两层都重置为 Empty，
 //     并计入已实现盈亏。这里通过检查该层是否本就"配对"来简化判断。
-func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *Level, currentPrice float64) []Event {
+//
+// order 是本层这笔单子的交易所真实状态（来自 OnTick 里的 GetOrder），优先使用它
+// 返回的真实成交数量/均价做记账；只有在极端情况下查不到订单详情（order == nil，
+// 见 OnTick 中"缺少交易所订单ID"的兜底分支）时，才退化使用下单时记录的
+// lvl.OrderQty / 挂单价 lvl.Price 兜底。
+//
+// 修复说明：这里以前是无论如何都用 PerGridQuoteAmount/lvl.Price 重新估算一遍数量，
+// 而实际下单时（placeMissingOrders/placeTakeProfit）用的是另一个价格基准算出来的
+// 数量，两者对不上，导致这里记的"持仓数量"和交易所真实成交的数量不一致，后续挂出
+// 的止盈单数量也跟着错，可能被交易所拒单（现货余额不够/合约减仓单超过持仓）或
+// 留下永远平不掉的残余仓位。
+func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *Level, order *exchange.Order) []Event {
 	var events []Event
-	qty := e.cfg.PerGridQuoteAmount / lvl.Price
+	qty := lvl.OrderQty
+	price := lvl.Price
+	if qty <= 0 {
+		// 兜底：连 OrderQty 都没有记录到的极端情况（理论不应发生），退回旧的估算方式。
+		qty = e.cfg.PerGridQuoteAmount / lvl.Price
+	}
+	if order != nil {
+		if order.FilledQuantity > 0 {
+			qty = order.FilledQuantity
+		}
+		if order.AvgFillPrice > 0 {
+			price = order.AvgFillPrice
+		}
+	}
 
 	lvl.Status = LevelFilled
 	lvl.FilledQty = qty
-	lvl.FilledPrice = lvl.Price
+	lvl.FilledPrice = price
 	lvl.FilledAt = time.Now()
 	lvl.OrderClientID = ""
 	lvl.ExchangeOrderID = ""
 
 	events = append(events, Event{Time: time.Now(), Type: "grid_filled",
-		Message: fmt.Sprintf("网格成交 level=%d price=%.4f qty=%.6f", lvl.Index, lvl.Price, qty)})
+		Message: fmt.Sprintf("网格成交 level=%d price=%.4f qty=%.6f", lvl.Index, price, qty)})
 
 	events = append(events, e.pairAndPlaceTakeProfit(ctx, ex, lvl, qty)...)
 	return events
@@ -586,11 +630,25 @@ func (e *Engine) pairAndPlaceTakeProfit(ctx context.Context, ex exchange.Exchang
 		return events
 	}
 
-	e.placeTakeProfit(ctx, ex, side, posSide, pairLvl.Price, qty, pairLvl)
+	if pairLvl.Status == LevelOrderOpen {
+		// 配对层已经挂着止盈单了（比如 ensureTakeProfits 兜底重扫时发现的），
+		// 不重复下单，避免同一笔持仓被挂出两张止盈单。
+		return events
+	}
+
+	if err := e.placeTakeProfit(ctx, ex, side, posSide, pairLvl.Price, qty, pairLvl); err != nil {
+		// 修复说明：以前这里的失败是被静默吞掉的——不记日志、没有任何重试路径，
+		// 持仓从此变成没有出场单保护的"裸仓位"。现在把失败原因记成事件，
+		// 并且由 OnTick 里每个 tick 都会跑的 ensureTakeProfits 自动重试，
+		// 直到成功挂出为止。
+		events = append(events, Event{Time: time.Now(), Type: "error",
+			Message: fmt.Sprintf("level=%d 挂止盈单失败（数量=%.6f 目标层=%d 价格=%.4f），将在下个tick自动重试: %v",
+				lvl.Index, qty, pairIndex, pairLvl.Price, err)})
+	}
 	return events
 }
 
-func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side exchange.Side, posSide exchange.PositionSide, price, qty float64, targetLvl *Level) {
+func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side exchange.Side, posSide exchange.PositionSide, price, qty float64, targetLvl *Level) error {
 	e.seq++
 	clientID := fmt.Sprintf("%s-TP-%d-%s-%d", e.cfg.Symbol, targetLvl.Index, e.instanceID, e.seq)
 	order, err := ex.PlaceOrder(ctx, exchange.OrderRequest{
@@ -604,11 +662,29 @@ func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side
 		ClientOrderID: clientID,
 	})
 	if err != nil {
-		return
+		return err
 	}
 	targetLvl.Status = LevelOrderOpen
 	targetLvl.OrderClientID = clientID
 	targetLvl.ExchangeOrderID = order.ExchangeOrderID
+	targetLvl.OrderQty = qty
+	return nil
+}
+
+// ensureTakeProfits 兜底扫描：任何处于"已成交/持仓中"（LevelFilled）状态的层，
+// 理论上都应该有一个配对层正挂着止盈单（LevelOrderOpen）在等它成交。
+// 如果配对层是 Empty（说明止盈单从未成功挂出，或者被 recenter 撤销后没再挂回去），
+// 就重新尝试挂一次。pairAndPlaceTakeProfit 内部已经对"配对层已经是 OrderOpen/Filled"
+// 的情况做了跳过处理，这里可以安全地每个 tick 都调用，不会产生重复止盈单。
+func (e *Engine) ensureTakeProfits(ctx context.Context, ex exchange.Exchange) []Event {
+	var events []Event
+	for _, lvl := range e.levels {
+		if lvl.Status != LevelFilled || lvl.FilledQty <= 0 {
+			continue
+		}
+		events = append(events, e.pairAndPlaceTakeProfit(ctx, ex, lvl, lvl.FilledQty)...)
+	}
+	return events
 }
 
 // shouldRecenter 判断价格是否已经偏离网格中心足够远（视为趋势而非震荡），
