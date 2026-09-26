@@ -138,6 +138,22 @@ type Level struct {
 	FilledQty   float64   `json:"filled_qty"`
 	FilledPrice float64   `json:"filled_price"`
 	FilledAt    time.Time `json:"filled_at"`
+
+	// IsExitOrder / PairWithIndex 明确记录这一层此刻的"角色"和"配对对象"，
+	// 不再靠"配对层状态是否恰好是Filled"这种间接推断来判断一笔成交
+	// 到底是"新开仓需要挂止盈"还是"止盈单成交需要平仓结算"。
+	//
+	// 修复说明：只做多模式下 index<0 的层永远只应该是建仓买单，绝不可能是
+	// 平仓单；但价格一根K线跌穿两层（比如 -1 和 -2 相继成交）是网格策略
+	// 的正常操作，出现频率并不低。以前的代码遇到这种情况会把"-2 全新买入"
+	// 误判成"给 -1 那笔仓位平仓"（因为它只看"-1 现在状态是不是Filled"，
+	// 不管 -1 是被谁、以什么方式占着的），编出一个不存在的"已实现盈亏"，
+	// 然后把两层的记录都清空——但交易所上这两笔仓位其实都还在，一个止盈单
+	// 都没挂出去，变成完全脱离监管的裸仓位，内部账目也跟着错。
+	// 有了这两个字段后，一笔成交是"该结算平仓"还是"该新挂止盈"，只看这一层
+	// 自己的 IsExitOrder 就行，不再依赖旁边那层凑巧处于什么状态。
+	IsExitOrder   bool `json:"is_exit_order"`
+	PairWithIndex int  `json:"pair_with_index"` // 0 表示未配对（0本身不是合法层号，可安全当作"无"）
 }
 
 // Snapshot 用于 Web 界面展示的网格快照（只读）
@@ -573,82 +589,119 @@ func (e *Engine) onLevelFilled(ctx context.Context, ex exchange.Exchange, lvl *L
 	return events
 }
 
-// pairAndPlaceTakeProfit 给一个刚变成"已成交/持仓"状态的层，找到它的配对层
-// （通常是相邻一层），挂出对应的止盈单；如果配对层恰好已经持有反向仓位
-// （说明这笔正好是给已有持仓的平仓单），直接对冲结算已实现盈亏、两层都清空。
+// pairAndPlaceTakeProfit 处理一笔刚成交的订单的后续动作，分两种情况：
+//   - 如果这一层本身就是一张止盈单（lvl.IsExitOrder==true），说明是在给
+//     lvl.PairWithIndex 指向的建仓层平仓，直接按记录的配对关系结算已实现盈亏，
+//     两层都清空；
+//   - 如果这一层是一笔全新的建仓成交，就找一个空闲层挂出对应的止盈单
+//     （优先挂相邻层，被占用则往同方向继续找下一个空闲层）。
 //
 // 从两处调用：正常成交检测走 onLevelFilled；程序重启后核对交易所真实
 // 遗留持仓走 reconcileExistingPositions——两种场景都需要"给持仓层配一个
 // 止盈出口"，逻辑完全一样，抽成一个函数避免重复代码。
 func (e *Engine) pairAndPlaceTakeProfit(ctx context.Context, ex exchange.Exchange, lvl *Level, qty float64) []Event {
 	var events []Event
-	var pairIndex int
-	var side exchange.Side
-	var posSide exchange.PositionSide
-	if lvl.Index < 0 {
-		// 买单成交 -> 上一层挂卖单止盈（平多）。若紧邻层正好是中心线(0)，
-		// 跳过中心线取下一层，避免把配对层错误指向中心线（不存在的层）。
-		pairIndex = lvl.Index + 1
-		if pairIndex == 0 {
-			pairIndex = lvl.Index + 2
-		}
-		side = exchange.SideSell
-		posSide = exchange.PositionLong
-	} else {
-		pairIndex = lvl.Index - 1
-		if pairIndex == 0 {
-			pairIndex = lvl.Index - 2
-		}
-		side = exchange.SideBuy
-		posSide = exchange.PositionShort
-	}
 
-	pairLvl, ok := e.levels[pairIndex]
-	if !ok {
-		// 极端情况：配对层超出当前网格范围（例如网格层数设置过小）。
-		events = append(events, Event{Time: time.Now(), Type: "error",
-			Message: fmt.Sprintf("level=%d 配对层超出网格范围，建议增大网格层数(GridCount)", lvl.Index)})
-		return events
-	}
+	if lvl.IsExitOrder {
+		// 这一层本身就是一张止盈单，现在成交了：说明是在给 lvl.PairWithIndex
+		// 指向的那个建仓层平仓。直接按记录的配对关系结算，不用再靠"配对层
+		// 状态是不是Filled"去猜——这正是修复前的做法，会把"另一笔完全不
+		// 相关、恰好也是Filled状态的建仓层"误判成平仓对象（比如价格连续
+		// 跌穿多层，-1和-2先后成交，-2成交时如果去看"-1是不是Filled"，
+		// -1当然是Filled的，但那只是因为-1自己是笔独立的建仓，不代表-2在
+		// 给它平仓）。
+		entryLvl, ok := e.levels[lvl.PairWithIndex]
+		if !ok || entryLvl.Status != LevelFilled {
+			// 理论不应该出现：配对的建仓层已经不在网格范围内，或者状态不对
+			// （比如被 recenter/强平 提前清空了）。这笔止盈单在交易所那边
+			// 已经真实成交、持仓已经被平掉，所以这一层的状态无论如何都要
+			// 清空；只是这种情况下算不出准确的已实现盈亏，记录下来方便人工核对。
+			events = append(events, Event{Time: time.Now(), Type: "error",
+				Message: fmt.Sprintf("level=%d 止盈单成交，但配对建仓层level=%d状态异常，已实现盈亏无法准确计算，仅清空本层状态，请人工核对交易所实际持仓", lvl.Index, lvl.PairWithIndex)})
+			lvl.Status = LevelEmpty
+			lvl.OrderClientID = ""
+			lvl.ExchangeOrderID = ""
+			lvl.OrderQty = 0
+			lvl.IsExitOrder = false
+			lvl.PairWithIndex = 0
+			return events
+		}
 
-	if pairLvl.Status == LevelFilled {
-		// 配对层已经持有反向仓位（说明这是在给已有持仓做平仓单），
-		// 直接对冲计入已实现盈亏，两层都清空
-		pnl := (lvl.Price - pairLvl.FilledPrice) * qty
-		if lvl.Index > 0 {
+		pnl := (lvl.FilledPrice - entryLvl.FilledPrice) * qty
+		if entryLvl.Index > 0 {
+			// 配对的建仓层是开空仓（Neutral模式下 index>0 的层）：
+			// 买入平空时，赚的是"开空价更高、买回补仓价更低"，方向和多头相反。
 			pnl = -pnl
 		}
 		e.realizedPnL += pnl
 		lvl.Status = LevelEmpty
 		lvl.OrderClientID = ""
 		lvl.ExchangeOrderID = ""
-		pairLvl.Status = LevelEmpty
-		pairLvl.OrderClientID = ""
-		pairLvl.ExchangeOrderID = ""
+		lvl.OrderQty = 0
+		lvl.IsExitOrder = false
+		lvl.PairWithIndex = 0
+		entryLvl.Status = LevelEmpty
+		entryLvl.OrderClientID = ""
+		entryLvl.ExchangeOrderID = ""
+		entryLvl.OrderQty = 0
+		entryLvl.FilledQty = 0
+		entryLvl.FilledPrice = 0
 		events = append(events, Event{Time: time.Now(), Type: "take_profit",
-			Message: fmt.Sprintf("配对止盈 level=%d<->%d 已实现盈亏=%.4f", lvl.Index, pairIndex, pnl)})
+			Message: fmt.Sprintf("配对止盈 level=%d<->%d 已实现盈亏=%.4f", entryLvl.Index, lvl.Index, pnl)})
 		return events
 	}
 
-	if pairLvl.Status == LevelOrderOpen {
-		// 配对层已经挂着止盈单了（比如 ensureTakeProfits 兜底重扫时发现的），
-		// 不重复下单，避免同一笔持仓被挂出两张止盈单。
-		return events
+	// 走到这里，说明 lvl 是一笔全新的建仓成交（买入开多，或 Neutral 模式下
+	// 卖出开空），需要挂一张止盈单。优先挂在紧邻的那一层；如果紧邻层已经被
+	// 占用（比如价格连续跌穿多层，相邻层还留着另一笔尚未平仓的独立仓位或
+	// 挂单），就继续往同一方向找下一个空闲层，而不是像修复前那样直接把
+	// 别人的仓位记录当成平仓对象冲掉。
+	var step int
+	var side exchange.Side
+	var posSide exchange.PositionSide
+	if lvl.Index < 0 {
+		step = 1
+		side = exchange.SideSell
+		posSide = exchange.PositionLong
+	} else {
+		step = -1
+		side = exchange.SideBuy
+		posSide = exchange.PositionShort
 	}
 
-	if err := e.placeTakeProfit(ctx, ex, side, posSide, pairLvl.Price, qty, pairLvl); err != nil {
-		// 修复说明：以前这里的失败是被静默吞掉的——不记日志、没有任何重试路径，
-		// 持仓从此变成没有出场单保护的"裸仓位"。现在把失败原因记成事件，
-		// 并且由 OnTick 里每个 tick 都会跑的 ensureTakeProfits 自动重试，
-		// 直到成功挂出为止。
-		events = append(events, Event{Time: time.Now(), Type: "error",
-			Message: fmt.Sprintf("level=%d 挂止盈单失败（数量=%.6f 目标层=%d 价格=%.4f），将在下个tick自动重试: %v",
-				lvl.Index, qty, pairIndex, pairLvl.Price, err)})
+	pairIndex := lvl.Index + step
+	if pairIndex == 0 {
+		pairIndex += step
 	}
-	return events
+	for {
+		pairLvl, ok := e.levels[pairIndex]
+		if !ok {
+			events = append(events, Event{Time: time.Now(), Type: "error",
+				Message: fmt.Sprintf("level=%d 找不到空闲的止盈挂靠层（已尝试到level=%d），建议增大网格层数(GridCount)，本次将在下个tick自动重试", lvl.Index, pairIndex-step)})
+			return events
+		}
+		if pairLvl.Status == LevelEmpty {
+			if err := e.placeTakeProfit(ctx, ex, side, posSide, pairLvl.Price, qty, pairLvl, lvl.Index); err != nil {
+				events = append(events, Event{Time: time.Now(), Type: "error",
+					Message: fmt.Sprintf("level=%d 挂止盈单失败（数量=%.6f 目标层=%d 价格=%.4f），将在下个tick自动重试: %v",
+						lvl.Index, qty, pairIndex, pairLvl.Price, err)})
+			}
+			return events
+		}
+		if pairLvl.Status == LevelOrderOpen && pairLvl.IsExitOrder && pairLvl.PairWithIndex == lvl.Index {
+			// 已经是这一层自己的止盈单了（比如 ensureTakeProfits 兜底重扫时
+			// 发现的），不重复下单。
+			return events
+		}
+		// 这一层被别的仓位/挂单占用了，继续往同一方向找下一层。
+		pairIndex += step
+		if pairIndex == 0 {
+			pairIndex += step
+		}
+	}
 }
 
-func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side exchange.Side, posSide exchange.PositionSide, price, qty float64, targetLvl *Level) error {
+func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side exchange.Side, posSide exchange.PositionSide, price, qty float64, targetLvl *Level, entryIndex int) error {
 	e.seq++
 	clientID := fmt.Sprintf("%s-TP-%d-%s-%d", e.cfg.Symbol, targetLvl.Index, e.instanceID, e.seq)
 	order, err := ex.PlaceOrder(ctx, exchange.OrderRequest{
@@ -668,6 +721,10 @@ func (e *Engine) placeTakeProfit(ctx context.Context, ex exchange.Exchange, side
 	targetLvl.OrderClientID = clientID
 	targetLvl.ExchangeOrderID = order.ExchangeOrderID
 	targetLvl.OrderQty = qty
+	// 明确标记"这一层现在是止盈单，配对的建仓层是 entryIndex"——
+	// 之后这笔止盈单成交时，直接按这两个字段判断该怎么结算，不再去猜。
+	targetLvl.IsExitOrder = true
+	targetLvl.PairWithIndex = entryIndex
 	return nil
 }
 
@@ -794,7 +851,7 @@ func (e *Engine) ForceReset(ctx context.Context, ex exchange.Exchange) error {
 // 已经不存在了，继续挂着只会变成一个减仓方向对不上任何真实持仓的孤儿单。
 // 其它层完全不动，继续按各自计划运行。
 //
-// pairIndex 的推导逻辑必须和 pairAndPlaceTakeProfit 保持一致，否则会清错层。
+// 直接按 PairWithIndex 精确匹配对应的止盈层，不再需要公式反推，见下方实现。
 func (e *Engine) ResetPositionSide(ctx context.Context, ex exchange.Exchange, posSide exchange.PositionSide) []Event {
 	var events []Event
 	for idx, lvl := range e.levels {
@@ -803,30 +860,25 @@ func (e *Engine) ResetPositionSide(ctx context.Context, ex exchange.Exchange, po
 			continue
 		}
 
-		var pairIndex int
-		if posSide == exchange.PositionLong {
-			pairIndex = idx + 1
-			if pairIndex == 0 {
-				pairIndex = idx + 2
-			}
-		} else {
-			pairIndex = idx - 1
-			if pairIndex == 0 {
-				pairIndex = idx - 2
-			}
-		}
-
-		if pairLvl, ok := e.levels[pairIndex]; ok && pairLvl.Status == LevelOrderOpen {
-			if pairLvl.ExchangeOrderID != "" {
-				if err := ex.CancelOrder(ctx, e.cfg.Symbol, pairLvl.ExchangeOrderID); err != nil {
-					events = append(events, Event{Time: time.Now(), Type: "error",
-						Message: fmt.Sprintf("撤销level=%d遗留止盈单失败（持仓已被强平，该单已无对应库存，请手动核对交易所挂单）: %v", pairIndex, err)})
+		// 直接按 PairWithIndex 精确找到这个建仓层对应的止盈层，不再用
+		// "相邻层"公式反推——止盈单如果因为相邻层被占用而挂到了更远一层
+		// （见 pairAndPlaceTakeProfit 的向外搜索逻辑），公式反推会找错层。
+		for _, pairLvl := range e.levels {
+			if pairLvl.Status == LevelOrderOpen && pairLvl.IsExitOrder && pairLvl.PairWithIndex == idx {
+				if pairLvl.ExchangeOrderID != "" {
+					if err := ex.CancelOrder(ctx, e.cfg.Symbol, pairLvl.ExchangeOrderID); err != nil {
+						events = append(events, Event{Time: time.Now(), Type: "error",
+							Message: fmt.Sprintf("撤销level=%d遗留止盈单失败（持仓已被强平，该单已无对应库存，请手动核对交易所挂单）: %v", pairLvl.Index, err)})
+					}
 				}
+				pairLvl.Status = LevelEmpty
+				pairLvl.OrderClientID = ""
+				pairLvl.ExchangeOrderID = ""
+				pairLvl.OrderQty = 0
+				pairLvl.IsExitOrder = false
+				pairLvl.PairWithIndex = 0
+				break
 			}
-			pairLvl.Status = LevelEmpty
-			pairLvl.OrderClientID = ""
-			pairLvl.ExchangeOrderID = ""
-			pairLvl.OrderQty = 0
 		}
 
 		lvl.Status = LevelEmpty
