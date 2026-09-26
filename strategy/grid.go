@@ -763,21 +763,40 @@ func (e *Engine) shouldRecenter(currentPrice float64) bool {
 func (e *Engine) recenter(ctx context.Context, ex exchange.Exchange, currentPrice float64) ([]Event, error) {
 	var events []Event
 
+	// 分两类保留：
+	//   heldPositions：已经成交、正持仓等止盈的建仓层；
+	//   heldExits：已经挂在交易所上的止盈单——这些完全不需要动，重新居中
+	//   只是调整"以后新仓位挂在哪"的坐标系，不应该打断已经建好仓、正在
+	//   等止盈的单子（撤了再按新价格重挂，不仅要吃一次挂单价差/手续费，
+	//   撤单和重新挂单之间那个瞬间仓位还完全没有保护）。
+	heldPositions := map[int]*Level{}
+	heldExits := map[int]*Level{}
+	for idx, lvl := range e.levels {
+		if lvl.Status == LevelFilled {
+			cp := *lvl
+			heldPositions[idx] = &cp
+		} else if lvl.Status == LevelOrderOpen && lvl.IsExitOrder {
+			cp := *lvl
+			heldExits[idx] = &cp
+		}
+	}
+
+	// 只撤销还没成交的建仓挂单；heldExits 对应的止盈单一律不碰。
+	protectedOrderIDs := map[string]bool{}
+	for _, lvl := range heldExits {
+		if lvl.ExchangeOrderID != "" {
+			protectedOrderIDs[lvl.ExchangeOrderID] = true
+		}
+	}
 	openOrders, err := ex.GetOpenOrders(ctx, e.cfg.Symbol)
 	if err != nil {
 		return nil, err
 	}
 	for _, o := range openOrders {
-		_ = ex.CancelOrder(ctx, e.cfg.Symbol, o.ExchangeOrderID)
-	}
-
-	// 保留仍在持仓中的层，用于后续平仓单继续挂出
-	heldPositions := map[int]*Level{}
-	for idx, lvl := range e.levels {
-		if lvl.Status == LevelFilled {
-			cp := *lvl
-			heldPositions[idx] = &cp
+		if protectedOrderIDs[o.ExchangeOrderID] {
+			continue
 		}
+		_ = ex.CancelOrder(ctx, e.cfg.Symbol, o.ExchangeOrderID)
 	}
 
 	klines, err := ex.GetKlines(ctx, e.cfg.Symbol, "3m", 200)
@@ -788,8 +807,10 @@ func (e *Engine) recenter(ctx context.Context, ex exchange.Exchange, currentPric
 	e.buildLevels(center, spacing)
 
 	// 旧持仓层：按原成交价映射回新网格中最近的层，保持 Filled 状态，
-	// 这样旧仓位依然会在合适的价位被挂出平仓单，而不会丢失追踪
-	for _, held := range heldPositions {
+	// 这样旧仓位依然会在合适的价位被挂出平仓单，而不会丢失追踪。
+	// 同时记录 旧index -> 新index 的映射，供下面迁移止盈单时更新配对关系。
+	oldToNewEntryIdx := map[int]int{}
+	for oldIdx, held := range heldPositions {
 		nearestIdx := int(math.Round((held.FilledPrice - center) / spacing))
 		if nearestIdx == 0 {
 			nearestIdx = 1
@@ -802,6 +823,47 @@ func (e *Engine) recenter(ctx context.Context, ex exchange.Exchange, currentPric
 			lvl.FilledQty = held.FilledQty
 			lvl.FilledPrice = held.FilledPrice
 			lvl.FilledAt = held.FilledAt
+			oldToNewEntryIdx[oldIdx] = nearestIdx
+		}
+	}
+
+	// 迁移仍然挂在交易所上的止盈单：这些订单本身完全没动（价格、数量、
+	// 交易所订单号都是原来那笔，从头到尾没有被撤销过），这里只是让内部的
+	// 网格层结构"认领"回它，好让 OnTick 之后还能正常检测到它的成交。
+	// 找不到空位就按同方向继续往外找，避免和迁移过来的持仓层/新网格层冲突。
+	for _, exitLvl := range heldExits {
+		nearestIdx := int(math.Round((exitLvl.Price - center) / spacing))
+		if nearestIdx == 0 {
+			nearestIdx = 1
+			if exitLvl.Price < center {
+				nearestIdx = -1
+			}
+		}
+		step := 1
+		if nearestIdx < 0 {
+			step = -1
+		}
+		idx := nearestIdx
+		for {
+			if idx == 0 {
+				idx += step
+			}
+			target, ok := e.levels[idx]
+			if !ok {
+				events = append(events, Event{Time: time.Now(), Type: "error",
+					Message: fmt.Sprintf("重新居中后找不到空位安放遗留止盈单（原level=%d 价格=%.4f 订单号=%s），该止盈单仍在交易所上正常挂着，只是暂时脱离内部追踪，请留意其成交", exitLvl.Index, exitLvl.Price, exitLvl.ExchangeOrderID)})
+				break
+			}
+			if target.Status == LevelEmpty {
+				*target = *exitLvl
+				target.Index = idx
+				// 更新配对的建仓层索引：建仓层在新网格里的位置也变了。
+				if newEntryIdx, ok := oldToNewEntryIdx[exitLvl.PairWithIndex]; ok {
+					target.PairWithIndex = newEntryIdx
+				}
+				break
+			}
+			idx += step
 		}
 	}
 
@@ -809,8 +871,8 @@ func (e *Engine) recenter(ctx context.Context, ex exchange.Exchange, currentPric
 	e.recenterCount++
 
 	events = append(events, Event{Time: time.Now(), Type: "recenter",
-		Message: fmt.Sprintf("重新居中 #%d：新中心=%.4f 新间距=%.4f（原持仓层已迁移 %d 个）",
-			e.recenterCount, center, spacing, len(heldPositions))})
+		Message: fmt.Sprintf("重新居中 #%d：新中心=%.4f 新间距=%.4f（原持仓层已迁移 %d 个，遗留止盈单已迁移 %d 个，止盈单本身未被撤销）",
+			e.recenterCount, center, spacing, len(heldPositions), len(heldExits))})
 	return events, nil
 }
 
