@@ -374,6 +374,7 @@ async function renderMain(){
       <div class="stat"><div class="label">网格中心 (EMA)</div><div class="value">${fmt(snap.center,2)}</div></div>
       <div class="stat"><div class="label">网格间距</div><div class="value">${fmt(snap.spacing,2)} <span style="font-size:11px;color:var(--muted)">(${fmt(snap.spacing_pct,2)}%)</span></div></div>
       <div class="stat"><div class="label">已实现盈亏</div><div class="value ${snap.realized_pnl>=0?'pos':'neg'}">${fmt(snap.realized_pnl)}</div></div>
+      <div class="stat"><div class="label">浮动盈亏</div><div class="value ${snap.unrealized_pnl>=0?'pos':'neg'}">${fmt(snap.unrealized_pnl)}</div></div>
       <div class="stat"><div class="label">总持仓名义价值</div><div class="value">${fmt(snap.total_position_quote)}</div></div>
     </div>
     <div class="panels">

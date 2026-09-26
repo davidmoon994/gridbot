@@ -169,6 +169,11 @@ type Snapshot struct {
 	RecenterCount      int       `json:"recenter_count"`
 	TotalPositionQuote float64   `json:"total_position_quote"`
 	RealizedPnL        float64   `json:"realized_pnl"`
+	// UnrealizedPnL 是按当前市价实时估算的浮动盈亏（USDT/USDC），跟
+	// RealizedPnL 不是一回事：RealizedPnL 只在止盈单真正成交、完成一次
+	// 完整平仓时才会变化，价格波动本身不会让它跳动；这个字段才是"现在
+	// 账面上浮盈/浮亏多少"，会随行情实时变化。
+	UnrealizedPnL float64 `json:"unrealized_pnl"`
 }
 
 // Event 引擎在一次 OnTick 中产生的事件，供上层记录日志/推送前端
@@ -964,6 +969,25 @@ func (e *Engine) TotalPositionQuote() float64 {
 	return total
 }
 
+// UnrealizedPnL 按当前市价估算所有持仓层的浮动盈亏（USDT/USDC）。
+// 多头持仓（index<0）现价越高浮盈越多；Neutral模式下的空头持仓（index>0）
+// 现价越低浮盈越多。只统计已经建仓成交（Status==LevelFilled）的层，
+// 挂着还没成交的建仓单/止盈单不计入（那些还没有真实持仓，无所谓浮盈浮亏）。
+func (e *Engine) UnrealizedPnL(currentPrice float64) float64 {
+	total := 0.0
+	for _, lvl := range e.levels {
+		if lvl.Status != LevelFilled {
+			continue
+		}
+		if lvl.Index < 0 {
+			total += (currentPrice - lvl.FilledPrice) * lvl.FilledQty
+		} else {
+			total += (lvl.FilledPrice - currentPrice) * lvl.FilledQty
+		}
+	}
+	return total
+}
+
 // PositionSummary 汇总当前所有"多头"网格层（index<0，已成交未平仓）的持仓数量与
 // 加权平均成本价。
 //
@@ -1011,6 +1035,7 @@ func (e *Engine) Snapshot(currentPrice float64) Snapshot {
 		RecenterCount:      e.recenterCount,
 		TotalPositionQuote: e.TotalPositionQuote(),
 		RealizedPnL:        e.realizedPnL,
+		UnrealizedPnL:      e.UnrealizedPnL(currentPrice),
 	}
 }
 
