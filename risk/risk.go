@@ -27,7 +27,8 @@ type Limits struct {
 	MinOrderQuoteAmount float64
 
 	// MaxDrawdownFromPeakPct 单个持仓从最高浮盈回撤超过该比例（0~1）时，
-	// 触发强制平仓保护（对应 NOFX 的"回撤自动平仓"机制）
+	// 触发强制平仓保护（对应 NOFX 的"回撤自动平仓"机制）。
+	// 0 表示禁用这条防线（配合下面的 MaxLossFromEntryPct 绝对止损单独兜底）。
 	MaxDrawdownFromPeakPct float64
 
 	// MinPeakPctForProtection 浮盈峰值至少达到该百分比（如 1.0 表示1%）才启用回撤保护判断。
@@ -60,11 +61,14 @@ type Limits struct {
 // DefaultLimits 提供一组保守的默认硬约束，参考 NOFX 文档中的约束设定
 func DefaultLimits() Limits {
 	return Limits{
-		MaxLeverage:             20,
-		MaxPositionQuoteRatio:   0.5,
-		MaxTotalMarginRatio:     0.9,
-		MinOrderQuoteAmount:     12,
-		MaxDrawdownFromPeakPct:  0.5,
+		MaxLeverage:           20,
+		MaxPositionQuoteRatio: 0.5,
+		MaxTotalMarginRatio:   0.9,
+		MinOrderQuoteAmount:   12,
+		// MaxDrawdownFromPeakPct 暂时禁用（设为0）：观察期内只保留下面的绝对止损
+		// 单独兜底，回撤保护这条防线先停用两天看效果，需要时把这里改回一个
+		// >0 的比例（比如 0.5~0.6）即可重新启用，不用改其它代码。
+		MaxDrawdownFromPeakPct:  0,
 		MinPeakPctForProtection: 1.0, // 浮盈峰值需达到1%才启用回撤保护，过滤微小波动噪音
 		// MaxLossFromEntryPct 默认 15：口径与 CurrentUnrealizedPnLPct 一致（已乘杠杆），
 		// 按本项目默认杠杆 3x 折算，约等于价格从入场点反向波动 ~5% 就止损。
@@ -213,6 +217,10 @@ func (e *Engine) ShouldForceClose(state AccountState) (bool, string) {
 			state.CurrentUnrealizedPnLPct, e.limits.MaxLossFromEntryPct)
 	}
 
+	if e.limits.MaxDrawdownFromPeakPct <= 0 {
+		// 回撤保护已禁用，只依赖上面的绝对止损兜底
+		return false, ""
+	}
 	if state.PeakUnrealizedPnLPct < e.limits.MinPeakPctForProtection {
 		return false, ""
 	}

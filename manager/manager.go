@@ -454,11 +454,15 @@ func (m *Manager) tick(ctx context.Context, t *Trader) {
 			t.peakPnLPct[p.PositionSide] = 0
 			t.mu.Unlock()
 
-			// 强平是绕过网格引擎自身状态机直接对交易所下的单，引擎内部记录的
-			// 挂单/持仓状态已经和交易所真实状态不一致，整体重置后下次tick会
-			// 重新初始化整个网格，是保证状态一致性最简单可靠的做法。
-			if resetErr := t.engine.ForceReset(ctx, guardedEx); resetErr != nil {
-				log.Printf("[网格重置失败] %s: %v", t.Symbol, resetErr)
+			// 只精确清理这个方向涉及的层（已成交的持仓层+其配对止盈挂单），
+			// 不影响该网格上其它方向、其它未成交层的正常挂单——之前这里统一
+			// 调用 ForceReset 把整个网格所有层全部撤单清空重建，代价是只要
+			// 有一层触发保护线，其它运行正常的层也会被一起打断重来，震荡
+			// 行情下这道保护线容易被频繁触发，等于让"网格被腰斩重建"变成
+			// 了家常便饭，额外增加撤单/重挂成本和吃单手续费。
+			for _, ev := range t.engine.ResetPositionSide(ctx, guardedEx, p.PositionSide) {
+				_ = m.st.LogEvent(t.Symbol, ev.Type, ev.Message, ev.Time)
+				log.Printf("[%s] %s: %s", t.Symbol, ev.Type, ev.Message)
 			}
 		}
 	}

@@ -762,6 +762,9 @@ func (e *Engine) recenter(ctx context.Context, ex exchange.Exchange, currentPric
 // 已经不一致，与其尝试精细修补（哪一层该清空、哪些挂单该撤销很难可靠判断），
 // 不如整体撤销该交易对所有挂单、清空内部状态，下一次 OnTick 会自动重新
 // Initialize，相当于"推倒重来"，这是能保证状态一致性的最简单可靠的做法。
+//
+// 已不再被"回撤保护性强平"路径调用（见 ResetPositionSide），仅保留作为
+// 需要整体推倒重来时（比如手动排障）的兜底工具。
 func (e *Engine) ForceReset(ctx context.Context, ex exchange.Exchange) error {
 	openOrders, err := ex.GetOpenOrders(ctx, e.cfg.Symbol)
 	if err == nil {
@@ -772,6 +775,68 @@ func (e *Engine) ForceReset(ctx context.Context, ex exchange.Exchange) error {
 	e.levels = map[int]*Level{}
 	e.initialized = false
 	return err
+}
+
+// ResetPositionSide 只清理指定持仓方向（Long 对应 index<0 的买入层，Short 对应
+// index>0 的卖出层，仅 Neutral 模式会用到 Short）相关的层状态和挂单，不影响该
+// 网格上其它方向、其它未成交层的正常挂单。
+//
+// 背景：这里以前统一调用 ForceReset——"回撤保护性强平"只是把某一个方向的持仓
+// 用市价单平掉了，但 ForceReset 会把整个网格所有层的挂单全部撤销、状态全部
+// 清空重建。代价是只要有一层触发了保护线，其它运行正常、完全没问题的层
+// （包括同方向还没成交的建仓挂单、Neutral 模式下反方向的层）也会被一起打断
+// 重来。震荡行情下这道保护线很容易被频繁触发（比如浮盈刚过1%又回撤过半），
+// 于是"网格被腰斩重建"变成了家常便饭：不仅额外产生撤单/重挂成本、市价平仓
+// 的吃单手续费，还会打断其它本来快要正常走到止盈价的层，让它们也提前跟着
+// 陪葬。改成只精确处理被强平方向涉及到的层：已经建仓（Filled）的层，因为
+// 对应的持仓已经被外部市价单平掉了，标记清空；它们各自配对的止盈挂单
+// （如果已经挂出、状态是 OrderOpen）也一并撤销清空，因为止盈单对应的库存
+// 已经不存在了，继续挂着只会变成一个减仓方向对不上任何真实持仓的孤儿单。
+// 其它层完全不动，继续按各自计划运行。
+//
+// pairIndex 的推导逻辑必须和 pairAndPlaceTakeProfit 保持一致，否则会清错层。
+func (e *Engine) ResetPositionSide(ctx context.Context, ex exchange.Exchange, posSide exchange.PositionSide) []Event {
+	var events []Event
+	for idx, lvl := range e.levels {
+		isEntryLevel := (posSide == exchange.PositionLong && idx < 0) || (posSide == exchange.PositionShort && idx > 0)
+		if !isEntryLevel || lvl.Status != LevelFilled {
+			continue
+		}
+
+		var pairIndex int
+		if posSide == exchange.PositionLong {
+			pairIndex = idx + 1
+			if pairIndex == 0 {
+				pairIndex = idx + 2
+			}
+		} else {
+			pairIndex = idx - 1
+			if pairIndex == 0 {
+				pairIndex = idx - 2
+			}
+		}
+
+		if pairLvl, ok := e.levels[pairIndex]; ok && pairLvl.Status == LevelOrderOpen {
+			if pairLvl.ExchangeOrderID != "" {
+				if err := ex.CancelOrder(ctx, e.cfg.Symbol, pairLvl.ExchangeOrderID); err != nil {
+					events = append(events, Event{Time: time.Now(), Type: "error",
+						Message: fmt.Sprintf("撤销level=%d遗留止盈单失败（持仓已被强平，该单已无对应库存，请手动核对交易所挂单）: %v", pairIndex, err)})
+				}
+			}
+			pairLvl.Status = LevelEmpty
+			pairLvl.OrderClientID = ""
+			pairLvl.ExchangeOrderID = ""
+			pairLvl.OrderQty = 0
+		}
+
+		lvl.Status = LevelEmpty
+		lvl.OrderClientID = ""
+		lvl.ExchangeOrderID = ""
+		lvl.OrderQty = 0
+		lvl.FilledQty = 0
+		lvl.FilledPrice = 0
+	}
+	return events
 }
 
 // TotalPositionQuote 估算当前网格持有的总名义仓位价值（USDT），供风控引擎读取
