@@ -507,9 +507,14 @@ func (e *Engine) OnTick(ctx context.Context, ex exchange.Exchange) ([]Event, err
 		case exchange.OrderStatusCanceled, exchange.OrderStatusRejected:
 			// 被撤销/被拒绝：这一层重新变回空层，等待下一轮 placeMissingOrders 重新挂单，
 			// 绝不能当成交处理，否则会凭空产生一笔不存在的仓位记录。
+			// IsExitOrder/PairWithIndex/OrderQty 也要一并清空——这一层接下来可能被
+			// 复用成完全不相关的建仓单或止盈单，留着旧的角色标记会造成配对错乱。
 			lvl.Status = LevelEmpty
 			lvl.OrderClientID = ""
 			lvl.ExchangeOrderID = ""
+			lvl.OrderQty = 0
+			lvl.IsExitOrder = false
+			lvl.PairWithIndex = 0
 			events = append(events, Event{Time: time.Now(), Type: "info",
 				Message: fmt.Sprintf("level=%d 挂单被撤销/拒绝（状态=%s），已重置为空层", lvl.Index, order.Status)})
 		default:
@@ -661,6 +666,21 @@ func (e *Engine) pairAndPlaceTakeProfit(ctx context.Context, ex exchange.Exchang
 	// 占用（比如价格连续跌穿多层，相邻层还留着另一笔尚未平仓的独立仓位或
 	// 挂单），就继续往同一方向找下一个空闲层，而不是像修复前那样直接把
 	// 别人的仓位记录当成平仓对象冲掉。
+	//
+	// 下单之前先确认这笔持仓是不是已经在网格的某个地方挂着止盈单了——
+	// 不能只看"紧邻那几层"，要扫全部层。原因：ensureTakeProfits 每个tick
+	// 都会重新兜底扫描一次所有持仓层；如果某笔持仓当初因为紧邻层被占用，
+	// 止盈单被挂到了更远的地方，后来紧邻层又空出来了，重新扫描时如果不
+	// 做这个检查，会在新空出来的位置上又挂一张止盈单——同一笔仓位对应了
+	// 两张止盈单，其中一张先成交会正常结算、把持仓层清空，另一张之后成交
+	// 时就找不到还处于Filled状态的配对持仓层了（也就是上面那个"状态异常"
+	// 分支存在的原因之一）。
+	for _, existing := range e.levels {
+		if existing.Status == LevelOrderOpen && existing.IsExitOrder && existing.PairWithIndex == lvl.Index {
+			return events
+		}
+	}
+
 	var step int
 	var side exchange.Side
 	var posSide exchange.PositionSide
