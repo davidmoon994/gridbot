@@ -348,15 +348,25 @@ async function renderMain(){
     return;
   }
 
-  const levels = (snap.levels||[]).slice().sort((a,b)=>a.index-b.index);
-  const maxAbsIdx = Math.max(1, ...levels.map(l=>Math.abs(l.index)));
+  // 按价格排序（.ladder 是 column-reverse，价格最高的在最上面）。
+  // 止盈单不再占用网格层位，它的价格由对应持仓的成本价决定，所以用"价格"而不是"层号"排序，
+  // 才能让止盈单出现在它真实所处的价位上。
+  const levels = (snap.levels||[]).slice().sort((a,b)=>a.price-b.price || a.index-b.index);
 
   const ladderHTML = levels.map(l=>{
-    const cls = l.status==='empty' ? 'empty' : (l.index<0 ? 'buy':'sell');
+    // 颜色按"这一行实际的买卖方向"：多头建仓=买(绿)，多头止盈=卖(红)，空头相反。
+    let cls = 'empty';
+    if(l.status!=='empty'){
+      const isSell = l.is_exit_order ? !l.is_short : !!l.is_short;
+      cls = isSell ? 'sell' : 'buy';
+    }
     const filledCls = l.status==='filled' ? 'filled':'';
-    const badge = l.status==='filled' ? '<span class="badge filled">持仓</span>' : (l.status==='order_open' ? '<span class="badge">挂单</span>':'');
+    let badge = '';
+    if(l.status==='filled') badge = '<span class="badge filled">持仓</span>';
+    else if(l.status==='order_open') badge = l.is_exit_order ? '<span class="badge filled">止盈</span>' : '<span class="badge">挂单</span>';
+    const idxLabel = l.is_exit_order ? 'TP' : ((l.index>0?'+':'')+l.index);
     return `<div class="rung ${cls} ${filledCls}">
-      <span class="idx">${l.index>0?'+':''}${l.index}</span>
+      <span class="idx">${idxLabel}</span>
       <span class="bar"><i></i></span>
       <span class="price">${fmt(l.price,4)} ${badge}</span>
     </div>`;
