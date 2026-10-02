@@ -226,6 +226,30 @@
           <input name="recenter_threshold_grids" type="number" value="6" />
         </div>
       </div>
+      <div class="grid2">
+        <div>
+          <label>最小间距(%)</label>
+          <select name="min_spacing_percent" id="minSpacingSelect">
+            <option value="0.15" selected>0.15%</option>
+            <option value="0.25">0.25%</option>
+            <option value="0.3">0.3%</option>
+            <option value="0.5">0.5%</option>
+            <option value="1">1%</option>
+            <option value="2">2%</option>
+            <option value="5">5%</option>
+            <option value="10">10%</option>
+          </select>
+        </div>
+        <div>
+          <label>最大间距(%)</label>
+          <input name="max_spacing_percent" id="maxSpacingInput" type="number" step="0.1" value="3" min="0.15" />
+        </div>
+      </div>
+      <div class="hint" style="font-size:11px; color:var(--muted); margin:-6px 0 4px;">
+        间距由ATR动态计算，但会被限制在"最小间距"和"最大间距"这个区间内；
+        实际每笔止盈的毛利率大致等于当时的间距百分比，提高最小间距可以在手续费/滑点之外留出更厚的安全垫，
+        但也意味着触发止盈需要更大的价格波动。最大间距必须不小于最小间距，否则提交时会自动按最小间距对齐。
+      </div>
       <div>
         <label>本策略最大总仓位(USDT)</label>
         <input name="max_total_position_quote" type="number" value="2000" />
@@ -412,14 +436,27 @@ document.getElementById('createForm').addEventListener('submit', async (ev)=>{
   ev.preventDefault();
   const fd = new FormData(ev.target);
   const payload = Object.fromEntries(fd.entries());
-  ['grid_count','leverage','per_grid_quote_amount','atr_spacing_multiplier','recenter_threshold_grids','max_total_position_quote']
+  ['grid_count','leverage','per_grid_quote_amount','atr_spacing_multiplier','recenter_threshold_grids',
+   'max_total_position_quote','min_spacing_percent','max_spacing_percent']
     .forEach(k=> payload[k] = Number(payload[k]));
   payload.symbol = payload.symbol.toUpperCase();
+  if(payload.max_spacing_percent < payload.min_spacing_percent){
+    // 最大间距不能比最小间距还小，否则后端会按"先夹最小、再夹最大"的顺序，
+    // 悄悄把你选的最小间距又压回这个更小的最大值，等于白选——这里直接
+    // 自动对齐，不让这种情况发生。
+    payload.max_spacing_percent = payload.min_spacing_percent;
+  }
   try{
     await api('/api/grids', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     currentSymbol = payload.symbol;
     refreshStatus(); renderMain();
   } catch(e){ alert('启动失败: ' + e.message); }
+});
+
+document.getElementById('minSpacingSelect').addEventListener('change', (ev)=>{
+  const maxInput = document.getElementById('maxSpacingInput');
+  const minVal = Number(ev.target.value);
+  if(Number(maxInput.value) < minVal) maxInput.value = minVal;
 });
 
 refreshStatus();
