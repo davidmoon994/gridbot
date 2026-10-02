@@ -242,7 +242,7 @@
         </div>
         <div>
           <label>最大间距(%)</label>
-          <input name="max_spacing_percent" id="maxSpacingInput" type="number" step="0.1" value="3" min="0.15" />
+          <input name="max_spacing_percent" id="maxSpacingInput" type="number" step="0.1" value="3.05" min="0.15" />
         </div>
       </div>
       <div class="hint" style="font-size:11px; color:var(--muted); margin:-6px 0 4px;">
@@ -456,7 +456,14 @@ document.getElementById('createForm').addEventListener('submit', async (ev)=>{
 document.getElementById('minSpacingSelect').addEventListener('change', (ev)=>{
   const maxInput = document.getElementById('maxSpacingInput');
   const minVal = Number(ev.target.value);
-  if(Number(maxInput.value) < minVal) maxInput.value = minVal;
+  if(Number(maxInput.value) < minVal){
+    // 最大间距输入框是 min="0.15" + step="0.1" 的格子（0.15, 0.25, 0.35...），
+    // 直接把最小间距的值填进去很可能不在格子上（比如最小间距选5%，
+    // 0.15起步数到4.95下一格是5.05，5本身不合法），这里按格子取最近的合法值，
+    // 而不是原样抄一遍可能依然不合法的数字。
+    const n = Math.round((minVal - 0.15) / 0.1);
+    maxInput.value = (0.15 + n * 0.1).toFixed(2);
+  }
 });
 
 refreshStatus();
