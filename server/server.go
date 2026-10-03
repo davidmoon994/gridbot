@@ -125,6 +125,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/grids", s.handleListGrids)
 	s.mux.HandleFunc("POST /api/grids", s.handleCreateGrid)
 	s.mux.HandleFunc("POST /api/grids/{symbol}/stop", s.handleStopGrid)
+	s.mux.HandleFunc("DELETE /api/grids/{symbol}", s.handleDeleteGrid)
 	s.mux.HandleFunc("GET /api/grids/{symbol}/snapshot", s.handleSnapshot)
 	s.mux.HandleFunc("GET /api/grids/{symbol}/events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/grids/{symbol}/pnl-history", s.handlePnLHistory)
@@ -541,6 +542,18 @@ func (s *Server) handleCreateGrid(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStopGrid(w http.ResponseWriter, r *http.Request) {
 	symbol := r.PathValue("symbol")
 	s.mgr.StopGrid(symbol)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleDeleteGrid 彻底删除一个交易对（必须先停止）：清空本地保存的配置、
+// 事件日志、已实现盈亏历史。不会撤销/平掉交易所上任何遗留的挂单或持仓，
+// 删除前请自行去交易所确认清楚。
+func (s *Server) handleDeleteGrid(w http.ResponseWriter, r *http.Request) {
+	symbol := r.PathValue("symbol")
+	if err := s.mgr.DeleteGrid(symbol); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -314,10 +314,29 @@ async function refreshStatus(){
       listEl.innerHTML = grids.map(g => `
         <div class="symbol-item ${g.symbol===currentSymbol?'active':''}" data-symbol="${g.symbol}">
           <span class="name"><span class="dot ${g.running?'on':'off'}"></span>${g.symbol}</span>
-          <span style="font-family:var(--mono); color:${g.snapshot.realized_pnl>=0?'var(--long)':'var(--short)'}">${fmt(g.snapshot.realized_pnl)}</span>
+          <span style="display:flex; align-items:center; gap:8px;">
+            <span style="font-family:var(--mono); color:${g.snapshot.realized_pnl>=0?'var(--long)':'var(--short)'}">${fmt(g.snapshot.realized_pnl)}</span>
+            ${g.running ? '' : `<span class="del-symbol-btn" data-del-symbol="${g.symbol}" title="彻底删除（含历史数据）" style="color:var(--short); cursor:pointer; font-size:14px; line-height:1; padding:0 2px;">×</span>`}
+          </span>
         </div>`).join('');
       listEl.querySelectorAll('.symbol-item').forEach(el=>{
         el.addEventListener('click', ()=> selectSymbol(el.dataset.symbol));
+      });
+      listEl.querySelectorAll('.del-symbol-btn').forEach(el=>{
+        el.addEventListener('click', async (ev)=>{
+          ev.stopPropagation(); // 不要顺带触发外层 symbol-item 的点击选中
+          const sym = el.dataset.delSymbol;
+          // 删除是不可逆操作：本地保存的配置、事件日志、已实现盈亏历史都会被
+          // 彻底清空，而且这个操作不会去撤销/平掉交易所上任何遗留的挂单或
+          // 持仓，务必先在交易所自行确认清楚，否则删除之后软件这边就再也
+          // 不会提示你处理它们了。
+          if(!confirm(`确定要彻底删除 ${sym} 吗？\n\n本地保存的配置、事件日志、已实现盈亏历史都会被永久清空，无法恢复。\n\n这个操作不会撤销/平掉交易所上任何遗留的挂单或持仓，请先自行去交易所确认清楚。`)) return;
+          try{
+            await api(`/api/grids/${sym}`, {method:'DELETE'});
+            if(currentSymbol === sym) currentSymbol = null;
+            refreshStatus(); renderMain();
+          } catch(e){ alert('删除失败: ' + e.message); }
+        });
       });
       if(!currentSymbol && grids.length>0) selectSymbol(grids[0].symbol);
     }

@@ -197,6 +197,15 @@ func (s *Store) SaveGridConfig(symbol string, cfg interface{}, enabled bool) err
 	return err
 }
 
+// SetGridEnabled 只更新某个已保存配置的 enabled 标记（停止/恢复网格时用），
+// 不touch config_json本身。如果这个symbol还没有保存过配置（比如从未真正启动
+// 成功过），这里什么都不做——没有配置可言，也就无所谓"下次重启要不要恢复"。
+func (s *Store) SetGridEnabled(symbol string, enabled bool) error {
+	_, err := s.db.Exec(`UPDATE grid_configs SET enabled = ?, updated_at = ? WHERE symbol = ?`,
+		boolToInt(enabled), time.Now(), symbol)
+	return err
+}
+
 // LoadGridConfigs 加载所有已保存的网格配置（重启恢复用）
 func (s *Store) LoadGridConfigs() (map[string]json.RawMessage, map[string]bool, error) {
 	rows, err := s.db.Query(`SELECT symbol, config_json, enabled FROM grid_configs`)
@@ -217,6 +226,33 @@ func (s *Store) LoadGridConfigs() (map[string]json.RawMessage, map[string]bool, 
 		enabled[symbol] = en != 0
 	}
 	return configs, enabled, nil
+}
+
+// DeleteGridData 彻底删除某个交易对在本地数据库里的全部记录：网格配置、
+// 事件日志、已实现盈亏历史。三张表放在一个事务里一起删，要么全部成功、
+// 要么全部不生效，不会出现"配置删了但历史记录还在"这种半删状态。
+//
+// 这只清理本地数据库，不会也没有能力撤销/平掉交易所上的任何挂单或持仓——
+// 删除前必须保证这个交易对已经停止运行（由上层 manager 负责校验），
+// 而且强烈建议删除前自行去交易所确认没有遗留挂单/持仓，否则删除之后
+// 软件这边就彻底没有任何记录能提示你去处理它们了。
+func (s *Store) DeleteGridData(symbol string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM grid_configs WHERE symbol = ?`, symbol); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM events WHERE symbol = ?`, symbol); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM pnl_history WHERE symbol = ?`, symbol); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LogEvent 写入一条事件日志

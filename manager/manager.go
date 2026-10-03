@@ -316,6 +316,34 @@ func (m *Manager) StopGrid(symbol string) {
 		t.running = false
 		_ = m.st.LogEvent(symbol, "info", "停止移动网格策略", time.Now())
 	}
+	// 持久化停止状态：不这样做的话，下次程序重启时 restoreGrids 只看数据库里
+	// 保存的 enabled 字段，会把这个已经被手动停止的网格当成"之前在跑的"
+	// 重新拉起来——"停止"就变成了只在这次进程运行期间有效，不是真正停止。
+	_ = m.st.SetGridEnabled(symbol, false)
+}
+
+// DeleteGrid 彻底删除一个交易对：必须先停止（不允许删除正在运行的网格，
+// 避免删掉之后这个交易对的仓位/挂单彻底失去追踪），删除本地数据库里的全部
+// 记录（配置、事件日志、已实现盈亏历史），并从内存里移除。
+//
+// 跟 StopGrid 一样，这里不会、也没有能力去撤销/平掉交易所上任何遗留的挂单
+// 或持仓——删除前务必自己去交易所确认清楚，软件这边删掉之后就再也不会
+// 提示你处理它们了。
+func (m *Manager) DeleteGrid(symbol string) error {
+	m.mu.Lock()
+	t, ok := m.traders[symbol]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("交易对 %s 不存在", symbol)
+	}
+	if t.running {
+		m.mu.Unlock()
+		return fmt.Errorf("交易对 %s 正在运行中，请先停止再删除", symbol)
+	}
+	delete(m.traders, symbol)
+	m.mu.Unlock()
+
+	return m.st.DeleteGridData(symbol)
 }
 
 func (m *Manager) runLoop(ctx context.Context, t *Trader) {
