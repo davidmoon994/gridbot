@@ -22,8 +22,58 @@ import (
 )
 
 // maxConsecutiveErrors 是某个网格连续执行失败多少次后自动停止（保护措施：
-// 避免交易对拼写错误、API失效等问题导致无人值守时一直空转刷错误日志）
+// 避免交易对拼写错误、API失效等问题导致无人值守时一直空转刷错误日志）。
+//
+// 只统计 isTransientError 判断为"不是临时性"的失败——也就是看起来像是
+// 配置错误（交易对拼写错误、API密钥失效/权限不足、签名错误等重试也没用
+// 的问题）才会很快触发暂停，这类问题继续空转没有意义，早点停下来提醒人
+// 介入比较好。
 const maxConsecutiveErrors = 5
+
+// maxConsecutiveTransientErrors 是"临时性"失败（网络超时、交易所服务端
+// 一过性错误等，大概率等一等自己就好）连续出现多少次才会触发暂停。
+//
+// 背景：之前所有失败不分青红皂白都计入同一个只有5次容错的计数器，交易所
+// 一次几十秒的短暂抽风就能把网格永久停掉，必须靠人工发现、手动重启才能
+// 恢复——这段时间里风控的止损保护也跟着完全失效，因为止损检查也是跟着
+// tick走的。这里改成单独计数、给更高的容忍次数，让网格能够扛过这类短暂
+// 抖动、自动恢复，不需要人工介入；但也不是无限重试，持续失败太久（默认
+// tick间隔5秒 × 360 = 半小时）还是会停下来，避免真出问题时无人察觉。
+const maxConsecutiveTransientErrors = 360
+
+// isTransientError 判断一个 OnTick 失败看起来是不是"临时性"的——网络超时、
+// 连接被重置、交易所服务端自己返回的"未知错误/服务不可用/请求过于频繁"
+// 这类，大概率换个时间重试就好，不是需要人去介入修复的配置/权限问题。
+//
+// 故意保守：只对明确认识的几种模式放宽，其它一律按原来的方式处理（5次
+// 就暂停）——没见过的错误宁可谨慎地快速停下来提醒人，也不要错误地把真正
+// 的问题当成"无所谓，等等就好"而无限期放任不管。
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	patterns := []string{
+		"context deadline exceeded",
+		"context canceled",
+		"timeout",
+		"connection reset",
+		"connection refused",
+		"i/o timeout",
+		"eof",
+		"[-1000]", // Binance: UNKNOWN，服务端处理请求时发生未知错误
+		"[-1001]", // Binance: DISCONNECTED
+		"[-1003]", // Binance: TOO_MANY_REQUESTS
+		"[-1016]", // Binance: SERVICE_SHUTTING_DOWN
+		"502 ", "503 ", "504 ",
+	}
+	for _, p := range patterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // Trader 是单个交易对的运行状态
 type Trader struct {
@@ -49,8 +99,12 @@ type Trader struct {
 	dailyBaselineDate string
 
 	consecutiveErrors int
-	lastError         string
-	tickInterval      time.Duration
+	// consecutiveTransientErrors 单独计数"看起来是临时性"的失败（网络超时、
+	// 交易所服务端一过性错误等），不计入上面那个会触发快速自动暂停的计数器。
+	// 见 maxConsecutiveTransientErrors 的注释。
+	consecutiveTransientErrors int
+	lastError                  string
+	tickInterval               time.Duration
 }
 
 // Manager 管理所有交易对的 Trader 实例，以及当前生效的交易所连接
@@ -388,24 +442,43 @@ func (m *Manager) tick(ctx context.Context, t *Trader) {
 
 	events, err := t.engine.OnTick(ctx, guardedEx)
 	if err != nil {
+		transient := isTransientError(err)
+
 		t.mu.Lock()
 		t.lastError = err.Error()
-		t.consecutiveErrors++
-		count := t.consecutiveErrors
+		if transient {
+			t.consecutiveTransientErrors++
+		} else {
+			t.consecutiveErrors++
+		}
+		count, transientCount := t.consecutiveErrors, t.consecutiveTransientErrors
 		t.mu.Unlock()
-		_ = m.st.LogEvent(t.Symbol, "error", err.Error(), time.Now())
+
+		if transient {
+			_ = m.st.LogEvent(t.Symbol, "warning", fmt.Sprintf(
+				"（判定为临时性失败，第%d次，不计入快速暂停计数）%s", transientCount, err.Error()), time.Now())
+		} else {
+			_ = m.st.LogEvent(t.Symbol, "error", err.Error(), time.Now())
+		}
 
 		if count >= maxConsecutiveErrors {
 			_ = m.st.LogEvent(t.Symbol, "auto_paused", fmt.Sprintf(
-				"连续 %d 次执行失败，已自动停止该网格，请检查交易对拼写/网络/交易所凭证是否正确后手动重新启动",
+				"连续 %d 次执行失败（非临时性错误），已自动停止该网格，请检查交易对拼写/网络/交易所凭证是否正确后手动重新启动",
 				count), time.Now())
-			log.Printf("[自动暂停] %s 连续 %d 次执行失败，已自动停止", t.Symbol, count)
+			log.Printf("[自动暂停] %s 连续 %d 次执行失败（非临时性错误），已自动停止", t.Symbol, count)
+			m.StopGrid(t.Symbol)
+		} else if transientCount >= maxConsecutiveTransientErrors {
+			_ = m.st.LogEvent(t.Symbol, "auto_paused", fmt.Sprintf(
+				"连续 %d 次临时性失败（约%d分钟），交易所可能持续异常，已自动停止该网格，请检查网络/交易所状态后手动重新启动",
+				transientCount, transientCount*int(t.tickInterval/time.Second)/60), time.Now())
+			log.Printf("[自动暂停] %s 连续 %d 次临时性失败，已自动停止", t.Symbol, transientCount)
 			m.StopGrid(t.Symbol)
 		}
 		return
 	}
 	t.mu.Lock()
 	t.consecutiveErrors = 0
+	t.consecutiveTransientErrors = 0
 	t.mu.Unlock()
 
 	for _, e := range events {

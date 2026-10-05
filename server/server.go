@@ -493,7 +493,7 @@ func (req createGridRequest) toConfig() strategy.Config {
 		EMAPeriod:              orDefaultInt(req.EMAPeriod, 20),
 		ATRPeriod:              orDefaultInt(req.ATRPeriod, 14),
 		ATRSpacingMultiplier:   orDefaultFloat(req.ATRSpacingMultiplier, 0.6),
-		MinSpacingPercent:      orDefaultFloat(req.MinSpacingPercent, 0.15),
+		MinSpacingPercent:      orDefaultFloat(req.MinSpacingPercent, 0.5),
 		MaxSpacingPercent:      orDefaultFloat(req.MaxSpacingPercent, 3.0),
 		RecenterThresholdGrids: orDefaultFloat(req.RecenterThresholdGrids, 6),
 		MinRecenterIntervalSec: orDefaultInt(req.MinRecenterIntervalSec, 900),
