@@ -431,13 +431,28 @@ func (m *Manager) tick(ctx context.Context, t *Trader) {
 	}
 	t.mu.Unlock()
 
-	// 独立检测一次极端行情，不依赖本轮是否恰好有新订单要下——
-	// 否则熔断完全取决于"这个tick周期网格引擎正好要不要挂新单"这个偶然条件，极不可靠。
-	if currentTicker, tickerErr := rawEx.GetTicker(ctx, t.Symbol); tickerErr == nil {
+	// 独立检测一次极端行情 + 止损保护，完全不依赖本轮 OnTick 是否成功——
+	// 这两项都要先于 OnTick 执行，而且无论 OnTick 本轮成不成功都要照常跑完。
+	//
+	// 背景：之前止损检查（ShouldForceClose）是写在 OnTick 成功之后才会走到的
+	// 代码路径里的。只要 OnTick 本轮因为任何原因失败（哪怕是我们现在特意
+	// 放宽容忍、允许自动重试的"临时性"失败，比如交易所一次持续几分钟甚至
+	// 更久的服务异常），这一整个tick周期止损保护就会被跳过——容忍失败的
+	// 时间窗口拉得越长（比如半小时），止损失效的时间窗口就跟着拉得一样长，
+	// 恰恰是在交易所不稳定、最需要这道保护兜底的时候，它反而最可能失效。
+	// 现在把它提到最前面、独立执行，跟 OnTick 本轮是否成功彻底脱钩。
+	ticker, tickerErr := rawEx.GetTicker(ctx, t.Symbol)
+	if tickerErr == nil {
 		t.mu.RLock()
 		prevPrice := t.lastPrice
 		t.mu.RUnlock()
-		m.rk.CheckPriceMove(currentTicker.Price, prevPrice)
+		m.rk.CheckPriceMove(ticker.Price, prevPrice)
+
+		t.mu.Lock()
+		t.lastPrice = ticker.Price
+		t.mu.Unlock()
+
+		m.checkStopLoss(ctx, guardedEx, rawEx, t, ticker.Price)
 	}
 
 	events, err := t.engine.OnTick(ctx, guardedEx)
@@ -485,93 +500,94 @@ func (m *Manager) tick(ctx context.Context, t *Trader) {
 		_ = m.st.LogEvent(t.Symbol, e.Type, e.Message, e.Time)
 	}
 
-	ticker, err := rawEx.GetTicker(ctx, t.Symbol)
+	if ticker2, err := rawEx.GetTicker(ctx, t.Symbol); err == nil {
+		snap := t.engine.Snapshot(ticker2.Price)
+		_ = m.st.RecordPnLSnapshot(t.Symbol, snap.RealizedPnL, snap.TotalPositionQuote, time.Now())
+	}
+}
+
+// checkStopLoss 更新历史最高浮盈百分比（按持仓方向分别记录），并检查是否需要
+// 触发回撤保护性强平——真正对交易所下达市价平仓单，不只是记录日志。
+//
+// currentPositions 会根据当前是否为现货交易所自动选择数据来源（合约查交易所
+// 真实持仓；现货用网格引擎自己的记账合成虚拟持仓）。
+//
+// 故意独立于 OnTick 调用、独立于 engine 内部状态，哪怕本轮 OnTick 失败（无论
+// 是被判定为临时性、允许继续容忍重试的失败，还是即将触发自动暂停的失败），
+// 止损检查都照常执行——止损保护不能被"网格这一轮没能正常跑完"连带拖累失效。
+func (m *Manager) checkStopLoss(ctx context.Context, guardedEx, rawEx exchange.Exchange, t *Trader, currentPrice float64) {
+	positions, err := m.currentPositions(ctx, rawEx, t, t.Symbol)
 	if err != nil {
 		return
 	}
-	snap := t.engine.Snapshot(ticker.Price)
-	_ = m.st.RecordPnLSnapshot(t.Symbol, snap.RealizedPnL, snap.TotalPositionQuote, time.Now())
+	for _, p := range positions {
+		if p.EntryPrice <= 0 {
+			continue
+		}
+		pct := (currentPrice - p.EntryPrice) / p.EntryPrice * 100 * p.Leverage
+		if p.PositionSide == exchange.PositionShort {
+			pct = -pct
+		}
 
-	// 更新历史最高浮盈百分比（按持仓方向分别记录），并检查是否需要触发
-	// 回撤保护性强平——这里不再只记录日志，而是真正对交易所下达市价平仓单。
-	// currentPositions 会根据当前是否为现货交易所自动选择数据来源
-	// （合约查交易所真实持仓；现货用网格引擎自己的记账合成虚拟持仓）。
-	positions, err := m.currentPositions(ctx, rawEx, t, t.Symbol)
-	if err == nil {
-		for _, p := range positions {
-			if p.EntryPrice <= 0 {
-				continue
-			}
-			pct := (ticker.Price - p.EntryPrice) / p.EntryPrice * 100 * p.Leverage
-			if p.PositionSide == exchange.PositionShort {
-				pct = -pct
-			}
+		t.mu.Lock()
+		if pct > t.peakPnLPct[p.PositionSide] {
+			t.peakPnLPct[p.PositionSide] = pct
+		}
+		curPeak := t.peakPnLPct[p.PositionSide]
+		t.mu.Unlock()
 
-			t.mu.Lock()
-			if pct > t.peakPnLPct[p.PositionSide] {
-				t.peakPnLPct[p.PositionSide] = pct
-			}
-			curPeak := t.peakPnLPct[p.PositionSide]
-			t.mu.Unlock()
+		state := risk.AccountState{
+			PeakUnrealizedPnLPct:    curPeak,
+			CurrentUnrealizedPnLPct: pct,
+		}
+		shouldClose, reason := m.rk.ShouldForceClose(state)
+		if !shouldClose {
+			continue
+		}
 
-			state := risk.AccountState{
-				PeakUnrealizedPnLPct:    curPeak,
-				CurrentUnrealizedPnLPct: pct,
-			}
-			shouldClose, reason := m.rk.ShouldForceClose(state)
-			if !shouldClose {
-				continue
-			}
+		_ = m.st.LogEvent(t.Symbol, "force_close", reason, time.Now())
+		log.Printf("[强制平仓保护] %s(%s): %s", t.Symbol, p.PositionSide, reason)
 
-			_ = m.st.LogEvent(t.Symbol, "force_close", reason, time.Now())
-			log.Printf("[强制平仓保护] %s(%s): %s", t.Symbol, p.PositionSide, reason)
+		closeSide := exchange.SideSell
+		if p.PositionSide == exchange.PositionShort {
+			closeSide = exchange.SideBuy
+		}
+		_, closeErr := guardedEx.PlaceOrder(ctx, exchange.OrderRequest{
+			Symbol:       t.Symbol,
+			Side:         closeSide,
+			PositionSide: p.PositionSide,
+			Type:         exchange.OrderTypeMarket,
+			Quantity:     p.Quantity,
+			ReduceOnly:   true,
+			// 用毫秒级时间戳（13位）而不是纳秒级（19位）：币安要求
+			// ClientOrderID总长度不超过36个字符，"symbol-FORCECLOSE-纳秒时间戳"
+			// 这种拼法对长一点的交易对名称很容易超限（之前线上就是因为超限
+			// 导致强平下单直接失败，风控保护形同虚设），换成更短的标签
+			// 和毫秒精度，留出安全余量。
+			ClientOrderID: fmt.Sprintf("%s-FC-%d", t.Symbol, time.Now().UnixMilli()),
+		})
+		if closeErr != nil {
+			_ = m.st.LogEvent(t.Symbol, "error", "强平下单失败: "+closeErr.Error(), time.Now())
+			log.Printf("[强平下单失败] %s(%s): %v", t.Symbol, p.PositionSide, closeErr)
+			continue
+		}
+		_ = m.st.LogEvent(t.Symbol, "force_close", fmt.Sprintf("已对 %s 方向下达市价平仓单，数量=%.6f", p.PositionSide, p.Quantity), time.Now())
 
-			closeSide := exchange.SideSell
-			if p.PositionSide == exchange.PositionShort {
-				closeSide = exchange.SideBuy
-			}
-			_, closeErr := guardedEx.PlaceOrder(ctx, exchange.OrderRequest{
-				Symbol:       t.Symbol,
-				Side:         closeSide,
-				PositionSide: p.PositionSide,
-				Type:         exchange.OrderTypeMarket,
-				Quantity:     p.Quantity,
-				ReduceOnly:   true,
-				// 用毫秒级时间戳（13位）而不是纳秒级（19位）：币安要求
-				// ClientOrderID总长度不超过36个字符，"symbol-FORCECLOSE-纳秒时间戳"
-				// 这种拼法对长一点的交易对名称很容易超限（之前线上就是因为超限
-				// 导致强平下单直接失败，风控保护形同虚设），换成更短的标签
-				// 和毫秒精度，留出安全余量。
-				ClientOrderID: fmt.Sprintf("%s-FC-%d", t.Symbol, time.Now().UnixMilli()),
-			})
-			if closeErr != nil {
-				_ = m.st.LogEvent(t.Symbol, "error", "强平下单失败: "+closeErr.Error(), time.Now())
-				log.Printf("[强平下单失败] %s(%s): %v", t.Symbol, p.PositionSide, closeErr)
-				continue
-			}
-			_ = m.st.LogEvent(t.Symbol, "force_close", fmt.Sprintf("已对 %s 方向下达市价平仓单，数量=%.6f", p.PositionSide, p.Quantity), time.Now())
+		t.mu.Lock()
+		t.peakPnLPct[p.PositionSide] = 0
+		t.mu.Unlock()
 
-			t.mu.Lock()
-			t.peakPnLPct[p.PositionSide] = 0
-			t.mu.Unlock()
-
-			// 只精确清理这个方向涉及的层（已成交的持仓层+其配对止盈挂单），
-			// 不影响该网格上其它方向、其它未成交层的正常挂单——之前这里统一
-			// 调用 ForceReset 把整个网格所有层全部撤单清空重建，代价是只要
-			// 有一层触发保护线，其它运行正常的层也会被一起打断重来，震荡
-			// 行情下这道保护线容易被频繁触发，等于让"网格被腰斩重建"变成
-			// 了家常便饭，额外增加撤单/重挂成本和吃单手续费。
-			for _, ev := range t.engine.ResetPositionSide(ctx, guardedEx, p.PositionSide) {
-				_ = m.st.LogEvent(t.Symbol, ev.Type, ev.Message, ev.Time)
-				log.Printf("[%s] %s: %s", t.Symbol, ev.Type, ev.Message)
-			}
+		// 只精确清理这个方向涉及的层（已成交的持仓层+其配对止盈挂单），
+		// 不影响该网格上其它方向、其它未成交层的正常挂单——之前这里统一
+		// 调用 ForceReset 把整个网格所有层全部撤单清空重建，代价是只要
+		// 有一层触发保护线，其它运行正常的层也会被一起打断重来，震荡
+		// 行情下这道保护线容易被频繁触发，等于让"网格被腰斩重建"变成
+		// 了家常便饭，额外增加撤单/重挂成本和吃单手续费。
+		for _, ev := range t.engine.ResetPositionSide(ctx, guardedEx, p.PositionSide) {
+			_ = m.st.LogEvent(t.Symbol, ev.Type, ev.Message, ev.Time)
+			log.Printf("[%s] %s: %s", t.Symbol, ev.Type, ev.Message)
 		}
 	}
-
-	// 记录本次观察到的价格，供下一个tick周期的极端行情熔断判断使用
-	t.mu.Lock()
-	t.lastPrice = ticker.Price
-	t.mu.Unlock()
 }
 
 // Snapshot 返回某交易对当前网格状态快照
