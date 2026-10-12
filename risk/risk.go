@@ -7,6 +7,7 @@ package risk
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -116,6 +117,11 @@ type Decision struct {
 type Engine struct {
 	limits Limits
 
+	// mu 保护 circuitBreakerUntil：风控引擎是被所有交易对的 tick 协程共用的
+	// （每个交易对一个协程，每个tick都会调用 CheckPriceMove / Evaluate），
+	// 同时网页接口等其它协程也会读熔断状态。time.Time 是多字段结构体，
+	// 不加锁的并发读写不仅是数据竞争，还可能读到"一半新一半旧"的无效时间值。
+	mu                  sync.RWMutex
 	circuitBreakerUntil time.Time
 }
 
@@ -137,7 +143,10 @@ func (e *Engine) CheckPriceMove(lastPrice, prevPrice float64) {
 	}
 	movePct := absF(lastPrice-prevPrice) / prevPrice * 100
 	if movePct >= e.limits.CircuitBreakerPriceMovePct {
-		e.circuitBreakerUntil = time.Now().Add(time.Duration(e.limits.CircuitBreakerCooldownSec) * time.Second)
+		until := time.Now().Add(time.Duration(e.limits.CircuitBreakerCooldownSec) * time.Second)
+		e.mu.Lock()
+		e.circuitBreakerUntil = until
+		e.mu.Unlock()
 	}
 }
 
@@ -150,9 +159,9 @@ func (e *Engine) Evaluate(intent OrderIntent, state AccountState) Decision {
 	e.CheckPriceMove(state.LastPrice, state.PrevPrice)
 
 	// 0. 熔断期间只允许减仓单
-	if !intent.IsReduceOnly && time.Now().Before(e.circuitBreakerUntil) {
+	if inBreaker, until := e.InCircuitBreaker(); !intent.IsReduceOnly && inBreaker {
 		return Decision{Approved: false, Reason: fmt.Sprintf(
-			"熔断保护生效中（至 %s），暂停新开仓", e.circuitBreakerUntil.Format("15:04:05"))}
+			"熔断保护生效中（至 %s），暂停新开仓", until.Format("15:04:05"))}
 	}
 
 	if intent.IsReduceOnly {
@@ -234,7 +243,10 @@ func (e *Engine) ShouldForceClose(state AccountState) (bool, string) {
 
 // InCircuitBreaker 当前是否处于熔断期
 func (e *Engine) InCircuitBreaker() (bool, time.Time) {
-	return time.Now().Before(e.circuitBreakerUntil), e.circuitBreakerUntil
+	e.mu.RLock()
+	until := e.circuitBreakerUntil
+	e.mu.RUnlock()
+	return time.Now().Before(until), until
 }
 
 func absF(v float64) float64 {

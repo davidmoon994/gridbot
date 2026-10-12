@@ -145,7 +145,25 @@ func TestForceCloseActuallyClosesPosition(t *testing.T) {
 
 	// 价格小幅下跌（约-3%），只穿越最近的一层买单，建立多头仓位。
 	// 用轮询代替固定 sleep，避免在共享CPU的沙盒环境里因调度延迟导致的时序抖动。
-	paperEx.InjectPrice("TESTUSDT", 970)
+	// 价格要按"实际挂着的买单位置"来定，而不是写死一个数字：模拟盘的K线是随机的，
+	// 网格中心每次都不一样，而且中心可能高于现价——这时最靠近中心的那一层买单
+	// 根本不会挂出（只会在低于现价的位置挂买单），写死 970 有时根本跌不穿任何买单，
+	// 测试就会随机失败。取"最高那张买单"再往下一点点，稳定只穿越这一张。
+	snap, ok := mgr.Snapshot(context.Background(), "TESTUSDT")
+	if !ok || snap.Spacing <= 0 {
+		t.Fatalf("网格还没初始化完成，无法确定买单位置: %+v", snap)
+	}
+	openOrders, _ := paperEx.GetOpenOrders(context.Background(), "TESTUSDT")
+	topBuy := 0.0
+	for _, o := range openOrders {
+		if o.Side == exchange.SideBuy && o.Price > topBuy {
+			topBuy = o.Price
+		}
+	}
+	if topBuy == 0 {
+		t.Fatalf("网格没有挂出任何买单: %+v", openOrders)
+	}
+	paperEx.InjectPrice("TESTUSDT", topBuy-0.25*snap.Spacing)
 	var positions []exchange.Position
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -163,11 +181,15 @@ func TestForceCloseActuallyClosesPosition(t *testing.T) {
 
 	// 价格回升制造浮盈峰值，但不越过止盈单所在的价位（避免触发止盈平仓，
 	// 这里只是想制造"账面浮盈"，不是想测试正常止盈流程）
-	paperEx.InjectPrice("TESTUSDT", entryPrice+30)
+	// 止盈价 = 成本 + 一个间距，所以只回升半个间距——写死固定金额（比如 +30）的话，
+	// 间距比它小的时候就会越过止盈价，把仓位正常止盈平掉，测试就会随机失败。
+	paperEx.InjectPrice("TESTUSDT", entryPrice+0.5*snap.Spacing)
 	time.Sleep(300 * time.Millisecond)
 
 	// 价格回落到入场价下方，制造从峰值的深度回撤，应触发强平保护
-	paperEx.InjectPrice("TESTUSDT", entryPrice-20)
+	// 只回落到成本下方 0.75 个间距：足够制造深度回撤，又不会穿越更低一层买单（成本 - 1个间距），
+	// 避免在强平的同时又成交一笔新买单、干扰"强平后无持仓"的判断。
+	paperEx.InjectPrice("TESTUSDT", entryPrice-0.75*snap.Spacing)
 	time.Sleep(300 * time.Millisecond) // 给强平下单+网格重置留够时间
 
 	positionsAfter, _ := paperEx.GetPositions(context.Background(), "TESTUSDT")

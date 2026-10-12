@@ -343,6 +343,13 @@ func (m *Manager) StartGrid(cfg strategy.Config, tickInterval time.Duration) (st
 	}
 
 	engine := strategy.NewEngine(cfg)
+	// 从本地数据库接着上一次记录的累计已实现盈亏往下算，而不是每次启动/重启
+	// 都假装"从没盈利过"从0开始——不这样做的话，24小时/一周/一季度/半年/
+	// 一年窗口盈亏会在每次重启时被腰斩：重启前的盈亏凭空消失，窗口里的
+	// "今天"看起来会比实际少赚很多。
+	if points, err := m.st.PnLHistory(cfg.Symbol, 1); err == nil && len(points) > 0 {
+		engine.SeedRealizedPnL(points[0].RealizedPnL)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Trader{
 		Symbol:       cfg.Symbol,
@@ -605,7 +612,77 @@ func (m *Manager) Snapshot(ctx context.Context, symbol string) (strategy.Snapsho
 			price = ticker.Price
 		}
 	}
-	return t.engine.Snapshot(price), true
+	snap := t.engine.Snapshot(price)
+	if !t.running {
+		// 网格没有运行时，"当前使用的杠杆倍数"这个说法本身就没有意义——
+		// 配置里存的杠杆值跟"现在实际生效"是两回事，显示成0而不是配置里
+		// 的旧值，避免让人以为一个没在跑的网格还在按某个杠杆承担风险。
+		snap.Leverage = 0
+	}
+	return snap, true
+}
+
+// PnLWindow 是固定几个时间窗口的已实现盈亏变化量（不是累计总盈亏，是"这个
+// 窗口期间新增了多少"）。
+type PnLWindow struct {
+	Last24h  float64 `json:"last_24h"`
+	Last7d   float64 `json:"last_7d"`
+	Last90d  float64 `json:"last_90d"`  // 一季度，按90天算
+	Last180d float64 `json:"last_180d"` // 半年，按180天算
+	Last365d float64 `json:"last_365d"` // 一年
+}
+
+// PnLWindows 计算某个交易对最近24小时/一周/一季度/半年/一年的已实现盈亏变化。
+//
+// 完全基于本地数据库里的历史快照计算，跟这个网格现在是不是在运行、engine
+// 实例还在不在内存里都没有关系——网格哪怕已经停止运行，只要数据库里有
+// 历史记录，这几个窗口的数字依然是准的，不会因为网格被停掉或者进程重启
+// 就归零或者消失。
+//
+// 每个窗口 = 当前累计已实现盈亏 - 窗口起点那一刻的累计已实现盈亏。如果数据库
+// 里压根没有那么早的记录（比如这个网格运行的时间比查询的窗口还短），起点
+// 按0算——这种情况下窗口期里确实没有更早的基准可减，全部历史都应该算在
+// 这个窗口以内，而不是漏算。
+func (m *Manager) PnLWindows(symbol string) (PnLWindow, bool, error) {
+	latestPoints, err := m.st.PnLHistory(symbol, 1)
+	if err != nil {
+		return PnLWindow{}, false, err
+	}
+	if len(latestPoints) == 0 {
+		return PnLWindow{}, false, nil
+	}
+	latest := latestPoints[0].RealizedPnL
+	now := time.Now()
+
+	window := func(d time.Duration) (float64, error) {
+		base, found, err := m.st.RealizedPnLAsOf(symbol, now.Add(-d))
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			base = 0
+		}
+		return latest - base, nil
+	}
+
+	var w PnLWindow
+	for _, pair := range []struct {
+		dst *float64
+		d   time.Duration
+	}{
+		{&w.Last24h, 24 * time.Hour},
+		{&w.Last7d, 7 * 24 * time.Hour},
+		{&w.Last90d, 90 * 24 * time.Hour},
+		{&w.Last180d, 180 * 24 * time.Hour},
+		{&w.Last365d, 365 * 24 * time.Hour},
+	} {
+		v, err := window(pair.d)
+		if err != nil {
+			return w, true, err
+		}
+		*pair.dst = v
+	}
+	return w, true, nil
 }
 
 // ListSymbols 返回当前所有已配置的交易对

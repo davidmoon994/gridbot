@@ -182,6 +182,10 @@ type Snapshot struct {
 	// 完整平仓时才会变化，价格波动本身不会让它跳动；这个字段才是"现在
 	// 账面上浮盈/浮亏多少"，会随行情实时变化。
 	UnrealizedPnL float64 `json:"unrealized_pnl"`
+	// Leverage 是这个网格配置的合约杠杆倍数。网格没有运行时这里不代表什么
+	// 实际含义（manager.Snapshot 会在网格停止运行时把这个字段覆盖成0，
+	// 见该函数注释）。
+	Leverage float64 `json:"leverage"`
 }
 
 // Event 引擎在一次 OnTick 中产生的事件，供上层记录日志/推送前端
@@ -1225,7 +1229,19 @@ func (e *Engine) Snapshot(currentPrice float64) Snapshot {
 		TotalPositionQuote: e.TotalPositionQuote(),
 		RealizedPnL:        e.realizedPnL,
 		UnrealizedPnL:      e.UnrealizedPnL(currentPrice),
+		Leverage:           e.cfg.Leverage,
 	}
+}
+
+// SeedRealizedPnL 把累计已实现盈亏设置成一个初始值，而不是从0开始计数。
+//
+// 用于程序重启、或者网格被重新绑定启动时：从本地数据库里读到这个交易对
+// 上一次记录的累计已实现盈亏，接着往下算，而不是每次重启都假装"从没
+// 盈利过"从0重新开始——重启前已经到手的利润是真实发生过的，不应该在
+// 展示上凭空消失。必须在第一次产生新的已实现盈亏之前调用，否则会覆盖掉
+// 这次运行期间刚刚产生的新盈亏。
+func (e *Engine) SeedRealizedPnL(v float64) {
+	e.realizedPnL = v
 }
 
 // Config 返回引擎当前配置（只读）

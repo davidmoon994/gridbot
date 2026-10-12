@@ -84,6 +84,10 @@ func (s *Store) migrate() error {
 			total_position_quote REAL NOT NULL,
 			created_at DATETIME NOT NULL
 		)`,
+		// 24小时/一周/一季度/半年/一年这几个窗口盈亏，每次都要按"symbol+时间"
+		// 查最近一条记录，没有这个索引的话随着 pnl_history 越攒越多（正常运行
+		// 每个tick都会插一条，一年下来单个交易对能有几百万行），查询会越来越慢。
+		`CREATE INDEX IF NOT EXISTS idx_pnl_history_symbol_time ON pnl_history(symbol, created_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -298,8 +302,11 @@ func (s *Store) RecentEvents(symbol string, limit int) ([]EventRecord, error) {
 
 // RecordPnLSnapshot 记录一次盈亏快照，用于绘制历史曲线
 func (s *Store) RecordPnLSnapshot(symbol string, realizedPnL, totalPositionQuote float64, t time.Time) error {
+	// 统一按 UTC 写入：时间在数据库里是以文本形式存的，窗口盈亏查询靠文本比较
+	// 先后，格式统一才能保证比较结果可靠（UTC() 同时会去掉 time.Now() 自带的
+	// 单调时钟后缀 "m=+..."）。
 	_, err := s.db.Exec(`INSERT INTO pnl_history (symbol, realized_pnl, total_position_quote, created_at) VALUES (?, ?, ?, ?)`,
-		symbol, realizedPnL, totalPositionQuote, t)
+		symbol, realizedPnL, totalPositionQuote, t.UTC())
 	return err
 }
 
@@ -326,6 +333,24 @@ func (s *Store) PnLHistory(symbol string, limit int) ([]PnLPoint, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// RealizedPnLAsOf 返回某个symbol在给定时间点"当时"的累计已实现盈亏——具体说，
+// 是 created_at <= at 里最新的一条记录。found=false 表示这个时间点之前完全
+// 没有任何记录（比如这个网格的运行历史比查询窗口还短），调用方应该把这种
+// 情况当成"这段时间里没有更早的基准可减"，直接把差值当成0到现在的全部累计。
+func (s *Store) RealizedPnLAsOf(symbol string, at time.Time) (value float64, found bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT realized_pnl FROM pnl_history WHERE symbol = ? AND created_at <= ? ORDER BY created_at DESC LIMIT 1`,
+		symbol, at.UTC(),
+	).Scan(&value)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return value, true, nil
 }
 
 func boolToInt(b bool) int {

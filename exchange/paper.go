@@ -202,19 +202,26 @@ func (p *PaperExchange) fillOrder(o *Order, fillPrice float64) {
 		signedQty = -signedQty // short: sell增加空头，buy平空
 	}
 
-	newQty := pos.Quantity + signedQty
-	if pos.Quantity == 0 || sameSign(pos.Quantity, newQty) {
-		// 加仓或开仓：更新均价
-		if newQty != 0 {
-			pos.EntryPrice = (pos.EntryPrice*math.Abs(pos.Quantity) + fillPrice*math.Abs(signedQty)) / math.Abs(newQty)
-		}
+	oldQty := pos.Quantity
+	newQty := oldQty + signedQty
+	switch {
+	case oldQty == 0:
+		// 开仓：成本价就是成交价
+		pos.EntryPrice = fillPrice
+	case signedQty > 0:
+		// 同方向加仓：按数量加权更新均价
+		pos.EntryPrice = (pos.EntryPrice*oldQty + fillPrice*signedQty) / newQty
+	case newQty < 0:
+		// 反向成交超过了现有仓位：穿过零点，超出部分是一笔反方向的新仓位，成本价=成交价
+		pos.EntryPrice = fillPrice
+	default:
+		// 减仓（含恰好平完）：成本价保持不变，只减少数量。
+		// 以前这里和加仓共用同一个加权公式，把"减掉的数量"也当成"新增的数量"加进去，
+		// 同一次价格跳动里先加仓再止盈时，成本价会被凭空放大好几倍（比如 959 变成 2869），
+		// 进而让止损/浮盈计算全部失真。
 	}
 	pos.Quantity = newQty
 	pos.MarginUsed = math.Abs(pos.Quantity) * pos.EntryPrice / pos.Leverage
-}
-
-func sameSign(a, b float64) bool {
-	return (a >= 0 && b >= 0) || (a <= 0 && b <= 0)
 }
 
 func (p *PaperExchange) updatePositionMark(symbol string, price float64) {

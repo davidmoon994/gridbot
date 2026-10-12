@@ -129,6 +129,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/grids/{symbol}/snapshot", s.handleSnapshot)
 	s.mux.HandleFunc("GET /api/grids/{symbol}/events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/grids/{symbol}/pnl-history", s.handlePnLHistory)
+	s.mux.HandleFunc("GET /api/grids/{symbol}/pnl-windows", s.handlePnLWindows)
 	s.mux.HandleFunc("GET /api/ticker/{symbol}", s.handleTicker)
 }
 
@@ -597,6 +598,23 @@ func (s *Server) handlePnLHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, points)
+}
+
+// handlePnLWindows 返回最近24小时/一周/一季度/半年/一年的已实现盈亏变化——
+// 纯粹基于本地数据库里的历史记录计算，跟这个交易对现在是不是在运行无关，
+// 网格停止运行或者进程重启都不会让这些数字归零或消失。
+func (s *Server) handlePnLWindows(w http.ResponseWriter, r *http.Request) {
+	symbol := r.PathValue("symbol")
+	windows, found, err := s.mgr.PnLWindows(symbol)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "该交易对还没有任何盈亏历史记录")
+		return
+	}
+	writeJSON(w, http.StatusOK, windows)
 }
 
 func (s *Server) handleTicker(w http.ResponseWriter, r *http.Request) {
