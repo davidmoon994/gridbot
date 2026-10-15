@@ -97,6 +97,9 @@ type AccountState struct {
 	PrevPrice               float64
 	PeakUnrealizedPnLPct    float64 // 该持仓历史最高浮盈百分比
 	CurrentUnrealizedPnLPct float64
+	// StopLossPct 这个网格自己配置的绝对止损线（保证金亏损%）。大于0时覆盖
+	// Limits.MaxLossFromEntryPct；为0表示这个网格没有单独配置，用引擎默认值。
+	StopLossPct float64
 }
 
 // OrderIntent 是策略提议的一笔订单，等待风控校验
@@ -213,6 +216,10 @@ func (e *Engine) Evaluate(intent OrderIntent, state AccountState) Decision {
 	return Decision{Approved: true}
 }
 
+// DefaultStopLossPct 返回引擎默认的绝对止损线（保证金亏损%），网格没有单独
+// 配置止损线时就用这个值。
+func (e *Engine) DefaultStopLossPct() float64 { return e.limits.MaxLossFromEntryPct }
+
 // ShouldForceClose 判断某个持仓是否触发"回撤保护"强制平仓：
 // 浮盈从历史峰值回撤超过设定比例。对应 prompt-guide 中提到的
 // "最高收益率"与"盈亏回撤"概念。
@@ -221,9 +228,13 @@ func (e *Engine) ShouldForceClose(state AccountState) (bool, string) {
 	// 必须放在回撤保护判断之前独立检查——回撤保护那条分支在浮盈从未摸到
 	// MinPeakPctForProtection 时会直接 return false，如果不单独判断这一条，
 	// "开仓后一路阴跌、从没盈利过"的行情会完全绕开所有强平保护。
-	if e.limits.MaxLossFromEntryPct > 0 && state.CurrentUnrealizedPnLPct <= -e.limits.MaxLossFromEntryPct {
+	maxLoss := e.limits.MaxLossFromEntryPct
+	if state.StopLossPct > 0 {
+		maxLoss = state.StopLossPct
+	}
+	if maxLoss > 0 && state.CurrentUnrealizedPnLPct <= -maxLoss {
 		return true, fmt.Sprintf("浮亏达到 %.2f%%，触及绝对止损线 %.1f%%，触发强制平仓",
-			state.CurrentUnrealizedPnLPct, e.limits.MaxLossFromEntryPct)
+			state.CurrentUnrealizedPnLPct, maxLoss)
 	}
 
 	if e.limits.MaxDrawdownFromPeakPct <= 0 {

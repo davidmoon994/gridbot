@@ -92,6 +92,14 @@ type Config struct {
 	// 两层限制都必须满足才会真正下单。
 	MaxTotalPositionQuote float64
 
+	// StopLossPct 绝对止损线：单个持仓的浮亏达到保证金的百分之多少就强制平仓。
+	// 口径是"相对保证金的亏损比例"（已经乘过杠杆），所以它对应的价格反向幅度
+	// 约等于 StopLossPct / Leverage——比如 10x 杠杆设 15，价格只要反向 1.5% 就止损。
+	// 设置时必须结合杠杆和网格间距一起考虑：止损线对应的价格幅度如果比网格
+	// 本身会买到的深度还浅，正常回调就会被打掉。
+	// 0 表示使用风控引擎的默认值（兼容旧配置，旧配置里没有这个字段）。
+	StopLossPct float64
+
 	// MarketType "futures"（合约，默认，兼容旧数据留空即视为合约） | "spot"（现货）。
 	// 现货没有杠杆/保证金/做空这些概念：
 	//   - Mode 必须是 ModeLongOnly，ModeNeutral（会开空）在现货下不合法，
@@ -111,6 +119,9 @@ func (cfg Config) IsSpot() bool { return cfg.MarketType == "spot" }
 func (cfg Config) Validate() error {
 	if cfg.IsSpot() && cfg.Mode == ModeNeutral {
 		return fmt.Errorf("现货交易不支持「中性双向」模式（现货无法做空），请改用「只做多」模式")
+	}
+	if cfg.StopLossPct != 0 && (cfg.StopLossPct < 1 || cfg.StopLossPct > 100) {
+		return fmt.Errorf("止损线必须在 1%% ~ 100%% 之间（按保证金亏损比例计），当前为 %.2f", cfg.StopLossPct)
 	}
 	return nil
 }
@@ -186,6 +197,9 @@ type Snapshot struct {
 	// 实际含义（manager.Snapshot 会在网格停止运行时把这个字段覆盖成0，
 	// 见该函数注释）。
 	Leverage float64 `json:"leverage"`
+	// StopLossPct 是这个网格配置的绝对止损线（保证金亏损%）。0 表示用风控引擎默认值，
+	// 由 manager.Snapshot 换算成实际生效的数值后再返回给前端。
+	StopLossPct float64 `json:"stop_loss_pct"`
 }
 
 // Event 引擎在一次 OnTick 中产生的事件，供上层记录日志/推送前端
@@ -1139,7 +1153,9 @@ func (e *Engine) ResetPositionSide(ctx context.Context, ex exchange.Exchange, po
 		idx := entry.Index
 		if x := e.findExitFor(idx); x != nil {
 			if x.ExchangeOrderID != "" {
-				if err := ex.CancelOrder(ctx, e.cfg.Symbol, x.ExchangeOrderID); err != nil {
+				if err := ex.CancelOrder(ctx, e.cfg.Symbol, x.ExchangeOrderID); err != nil && !isOrderAlreadyGone(err) {
+					// 订单本来就已经不存在（比如被交易所随仓位平掉自动取消）算撤销成功，
+					// 只有真正撤销失败、订单可能还挂着的情况才上报。
 					events = append(events, Event{Time: time.Now(), Type: "error",
 						Message: fmt.Sprintf("撤销遗留止盈单失败（持仓已被强平，该单已无对应库存，请手动核对交易所挂单）orderID=%s: %v", x.ExchangeOrderID, err)})
 				}
@@ -1230,7 +1246,36 @@ func (e *Engine) Snapshot(currentPrice float64) Snapshot {
 		RealizedPnL:        e.realizedPnL,
 		UnrealizedPnL:      e.UnrealizedPnL(currentPrice),
 		Leverage:           e.cfg.Leverage,
+		StopLossPct:        e.cfg.StopLossPct,
 	}
+}
+
+// StopLossPct 返回这个网格自己配置的绝对止损线（保证金亏损%），0 表示未单独
+// 配置、使用风控引擎的默认值。
+func (e *Engine) StopLossPct() float64 { return e.cfg.StopLossPct }
+
+// AddRealizedPnL 把一笔不是由"止盈单成交"产生的已实现盈亏计入累计——目前只有
+// 风控强制平仓会用到。
+//
+// 背景：已实现盈亏原来只在止盈单成交（settleExit）时才会增加，强平造成的亏损
+// 完全没有记账，于是"已实现盈亏"和各个时间窗口的盈亏卡片只反映了赚的部分，
+// 把亏损漏掉了，看起来比真实情况乐观。
+func (e *Engine) AddRealizedPnL(delta float64) {
+	e.realizedPnL += delta
+}
+
+// isOrderAlreadyGone 判断撤单失败是不是因为"订单已经不存在了"。
+// 币安会在仓位被平掉之后自动取消对应的只减仓单，程序再去撤销就会收到
+// [-2011] Unknown order——这种情况目标已经达到（订单没了），不是需要人工
+// 处理的错误，不应该当成失败上报。
+func isOrderAlreadyGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "[-2011]") ||
+		strings.Contains(msg, "unknown order") ||
+		strings.Contains(msg, "order does not exist")
 }
 
 // SeedRealizedPnL 把累计已实现盈亏设置成一个初始值，而不是从0开始计数。

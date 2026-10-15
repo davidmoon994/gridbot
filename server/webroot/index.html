@@ -251,6 +251,11 @@
         但也意味着触发止盈需要更大的价格波动。最大间距必须不小于最小间距，否则提交时会自动按最小间距对齐。
       </div>
       <div>
+        <label>止损线（保证金亏损%）</label>
+        <input name="stop_loss_pct" id="stopLossInput" type="number" step="0.5" min="1" max="100" value="15" />
+      </div>
+      <div class="hint" id="stopLossHint" style="font-size:11px; color:var(--muted); margin:-6px 0 4px;"></div>
+      <div>
         <label>本策略最大总仓位(USDT)</label>
         <input name="max_total_position_quote" type="number" value="2000" />
       </div>
@@ -365,6 +370,8 @@ function applySpotUIConstraints(exchangeId){
     leverageInput.readOnly = false;
     leverageInput.style.opacity = '1';
   }
+  // 程序改了杠杆的值（不会触发输入事件），手动刷新一次止损线的提示
+  if(typeof updateStopLossHint === 'function') updateStopLossHint();
 }
 
 function selectSymbol(symbol){
@@ -427,7 +434,7 @@ async function renderMain(){
     <div class="stat-row">
       <div class="stat"><div class="label">当前价格</div><div class="value">${fmt(ticker.price,2)}</div></div>
       <div class="stat"><div class="label">网格中心 (EMA)</div><div class="value">${fmt(snap.center,2)}</div></div>
-      <div class="stat"><div class="label">网格间距</div><div class="value">${fmt(snap.spacing,2)} <span style="font-size:11px;color:var(--muted)">(${fmt(snap.spacing_pct,2)}%)</span></div><div style="font-size:11px;color:var(--muted);margin-top:4px;">当前杠杆 <span style="font-family:var(--mono);color:var(--text);">${fmt(snap.leverage||0,0)}x</span></div></div>
+      <div class="stat"><div class="label">网格间距</div><div class="value">${fmt(snap.spacing,2)} <span style="font-size:11px;color:var(--muted)">(${fmt(snap.spacing_pct,2)}%)</span></div><div style="font-size:11px;color:var(--muted);margin-top:4px;">当前杠杆 <span style="font-family:var(--mono);color:var(--text);">${fmt(snap.leverage||0,0)}x</span>${(snap.leverage>0 && snap.stop_loss_pct>0) ? ` · 止损线 <span style="font-family:var(--mono);color:var(--text);">${fmt(snap.stop_loss_pct,1)}%</span>（价格反向≈${fmt(snap.stop_loss_pct/snap.leverage,2)}%）` : ''}</div></div>
       <div class="stat"><div class="label">已实现盈亏</div><div class="value ${snap.realized_pnl>=0?'pos':'neg'}">${fmt(snap.realized_pnl)}</div></div>
       <div class="stat"><div class="label">浮动盈亏</div><div class="value ${snap.unrealized_pnl>=0?'pos':'neg'}">${fmt(snap.unrealized_pnl)}</div></div>
       <div class="stat"><div class="label">总持仓名义价值</div><div class="value">${fmt(snap.total_position_quote)}</div></div>
@@ -464,7 +471,7 @@ document.getElementById('createForm').addEventListener('submit', async (ev)=>{
   const fd = new FormData(ev.target);
   const payload = Object.fromEntries(fd.entries());
   ['grid_count','leverage','per_grid_quote_amount','atr_spacing_multiplier','recenter_threshold_grids',
-   'max_total_position_quote','min_spacing_percent','max_spacing_percent']
+   'max_total_position_quote','min_spacing_percent','max_spacing_percent','stop_loss_pct']
     .forEach(k=> payload[k] = Number(payload[k]));
   payload.symbol = payload.symbol.toUpperCase();
   if(payload.max_spacing_percent < payload.min_spacing_percent){
@@ -492,6 +499,31 @@ document.getElementById('minSpacingSelect').addEventListener('change', (ev)=>{
     maxInput.value = (0.15 + n * 0.1).toFixed(2);
   }
 });
+
+// 止损线是"保证金亏损%"，对应的价格反向幅度 = 止损线 / 杠杆。
+// 如果这个价格幅度还不到最小网格间距的 2 倍，网格刚买到第 2~3 层，一次普通回调
+// 就会触发止损（10x 杠杆 + 15% 止损 + 1% 间距时就发生过），所以在这里直接提醒。
+function updateStopLossHint(){
+  const sl  = Number(document.getElementById('stopLossInput').value) || 0;
+  const lev = Number(document.getElementById('leverageInput').value) || 1;
+  const minSp = Number(document.getElementById('minSpacingSelect').value) || 0;
+  const hint = document.getElementById('stopLossHint');
+  if(sl <= 0){ hint.textContent = ''; return; }
+  const mv = sl / lev;
+  let text = `≈ 价格从成本价反向 ${mv.toFixed(2)}% 时强平（${sl}% ÷ 杠杆 ${lev}x）。`;
+  let warn = false;
+  if(minSp > 0 && mv < 2 * minSp){
+    text += `⚠ 不到最小间距(${minSp}%)的 2 倍，网格买到第 2~3 层后一次普通回调就可能触发止损；建议调高止损线或降低杠杆。`;
+    warn = true;
+  }
+  hint.textContent = text;
+  hint.style.color = warn ? 'var(--amber, #f0a93a)' : 'var(--muted)';
+}
+['stopLossInput','leverageInput','minSpacingSelect'].forEach(id=>{
+  document.getElementById(id).addEventListener('input', updateStopLossHint);
+  document.getElementById(id).addEventListener('change', updateStopLossHint);
+});
+updateStopLossHint();
 
 refreshStatus();
 setInterval(()=>{ refreshStatus(); renderMain(); }, 3000);

@@ -2,6 +2,8 @@ package strategy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -603,5 +605,116 @@ func TestClientOrderIDLength(t *testing.T) {
 		if len(id) > 36 {
 			t.Errorf("ClientOrderID 超长(%d>36): %s", len(id), id)
 		}
+	}
+}
+
+// cancelFailExchange 让所有撤单都返回指定错误，用来验证强平收尾时对撤单失败的分类处理。
+type cancelFailExchange struct {
+	*exchange.PaperExchange
+	err error
+}
+
+func (c *cancelFailExchange) CancelOrder(ctx context.Context, symbol, orderID string) error {
+	return c.err
+}
+
+// 强平之后清理遗留止盈单：交易所返回 [-2011] Unknown order（订单已经被随仓位平掉而自动取消）
+// 视为撤销成功，不上报错误；其它撤单失败（订单可能还挂着）仍然要上报。持仓记录两种情况下都要释放。
+func TestResetPositionSideTreatsUnknownOrderAsCancelled(t *testing.T) {
+	ctx := context.Background()
+	build := func() (*Engine, *exchange.PaperExchange) {
+		e, p := newScenario(t, "SIMUSDT", 1000)
+		tk, _ := p.GetTicker(ctx, "SIMUSDT")
+		p.InjectPrice("SIMUSDT", tk.Price-2.5*e.spacing) // 穿越前两层，建立两笔持仓并挂出止盈单
+		mustTick(t, e, p)
+		if n := len(openOrdersBy(p, "SIMUSDT", exchange.SideSell)); n < 2 {
+			t.Fatalf("前置条件不满足：应至少有 2 张止盈单，实际 %d", n)
+		}
+		return e, p
+	}
+
+	// 1) 订单已不存在：不应有任何错误事件
+	e, p := build()
+	gone := &cancelFailExchange{p, errors.New("binance API 错误 [-2011]: Unknown order sent.")}
+	evs := e.ResetPositionSide(ctx, gone, exchange.PositionLong)
+	for _, ev := range evs {
+		t.Errorf("订单已不存在不应上报错误，实际: [%s] %s", ev.Type, ev.Message)
+	}
+	if q := trackedLongQty(e); q != 0 {
+		t.Errorf("持仓记录应已释放，实际还剩 %.6f", q)
+	}
+	for _, l := range e.levels {
+		if l.IsExitOrder {
+			t.Errorf("止盈单记录应已移除: %+v", *l)
+		}
+	}
+
+	// 2) 其它撤单失败（比如网络问题）：每张止盈单一条错误，但持仓记录仍然释放
+	e, p = build()
+	nExits := 0
+	for _, l := range e.levels {
+		if l.IsExitOrder && l.Status == LevelOrderOpen {
+			nExits++
+		}
+	}
+	broken := &cancelFailExchange{p, errors.New("请求超时 context deadline exceeded")}
+	evs = e.ResetPositionSide(ctx, broken, exchange.PositionLong)
+	if len(evs) != nExits {
+		t.Errorf("真正的撤单失败应逐张上报：期望 %d 条错误，实际 %d 条", nExits, len(evs))
+	}
+	if q := trackedLongQty(e); q != 0 {
+		t.Errorf("即使撤单失败，持仓记录也应释放，实际还剩 %.6f", q)
+	}
+}
+
+// 校验：止损线只允许 0（用默认值）或 1~100。
+func TestConfigValidateStopLossPct(t *testing.T) {
+	for _, v := range []float64{0, 1, 15, 40, 100} {
+		cfg := scenarioConfig("X")
+		cfg.StopLossPct = v
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("StopLossPct=%.1f 应合法，实际报错: %v", v, err)
+		}
+	}
+	for _, v := range []float64{-5, 0.5, 100.5, 250} {
+		cfg := scenarioConfig("X")
+		cfg.StopLossPct = v
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("StopLossPct=%.1f 应被拒绝，但通过了校验", v)
+		}
+	}
+}
+
+// 兼容旧数据：数据库里已经保存的网格配置没有 StopLossPct 这个字段（0），
+// 重启恢复时必须能正常加载、通过校验，并沿用风控引擎的默认止损线。
+func TestOldStoredConfigWithoutStopLossStillLoads(t *testing.T) {
+	cfg := scenarioConfig("ETHUSDC")
+	cfg.StopLossPct = 33 // 新配置里有这个字段
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asMap map[string]interface{}
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := asMap["StopLossPct"]; !ok {
+		t.Fatal("前置条件：新配置序列化后应包含 StopLossPct")
+	}
+	delete(asMap, "StopLossPct") // 模拟升级前保存的旧配置
+	oldRaw, _ := json.Marshal(asMap)
+
+	var restored Config
+	if err := json.Unmarshal(oldRaw, &restored); err != nil {
+		t.Fatalf("旧配置应能解析: %v", err)
+	}
+	if err := restored.Validate(); err != nil {
+		t.Fatalf("旧配置应通过校验: %v", err)
+	}
+	if restored.StopLossPct != 0 {
+		t.Errorf("旧配置的止损线应为 0（表示用默认值），实际 %.2f", restored.StopLossPct)
+	}
+	if restored.GridCount != cfg.GridCount || restored.Leverage != cfg.Leverage {
+		t.Errorf("其它字段应原样保留: %+v", restored)
 	}
 }

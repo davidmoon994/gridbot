@@ -480,6 +480,7 @@ type createGridRequest struct {
 	Leverage               float64 `json:"leverage"`
 	Mode                   string  `json:"mode"` // "long_only" | "neutral"
 	MaxTotalPositionQuote  float64 `json:"max_total_position_quote"`
+	StopLossPct            float64 `json:"stop_loss_pct"`
 	TickIntervalSec        int     `json:"tick_interval_sec"`
 }
 
@@ -502,6 +503,7 @@ func (req createGridRequest) toConfig() strategy.Config {
 		Leverage:               orDefaultFloat(req.Leverage, 3),
 		Mode:                   mode,
 		MaxTotalPositionQuote:  orDefaultFloat(req.MaxTotalPositionQuote, 2000),
+		StopLossPct:            orDefaultFloat(req.StopLossPct, 15),
 	}
 	return cfg
 }

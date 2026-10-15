@@ -546,6 +546,7 @@ func (m *Manager) checkStopLoss(ctx context.Context, guardedEx, rawEx exchange.E
 		state := risk.AccountState{
 			PeakUnrealizedPnLPct:    curPeak,
 			CurrentUnrealizedPnLPct: pct,
+			StopLossPct:             t.engine.StopLossPct(), // 这个网格自己配置的止损线，0=用默认值
 		}
 		shouldClose, reason := m.rk.ShouldForceClose(state)
 		if !shouldClose {
@@ -559,7 +560,7 @@ func (m *Manager) checkStopLoss(ctx context.Context, guardedEx, rawEx exchange.E
 		if p.PositionSide == exchange.PositionShort {
 			closeSide = exchange.SideBuy
 		}
-		_, closeErr := guardedEx.PlaceOrder(ctx, exchange.OrderRequest{
+		closeOrder, closeErr := guardedEx.PlaceOrder(ctx, exchange.OrderRequest{
 			Symbol:       t.Symbol,
 			Side:         closeSide,
 			PositionSide: p.PositionSide,
@@ -579,6 +580,22 @@ func (m *Manager) checkStopLoss(ctx context.Context, guardedEx, rawEx exchange.E
 			continue
 		}
 		_ = m.st.LogEvent(t.Symbol, "force_close", fmt.Sprintf("已对 %s 方向下达市价平仓单，数量=%.6f", p.PositionSide, p.Quantity), time.Now())
+
+		// 把这次强平的盈亏记进已实现盈亏。成交均价优先用订单回报里的真实值；
+		// 市价单刚下出去时交易所往往还没回填均价，这时退而用下单时刻的行情价
+		// 估算，并在日志里注明是估算值（不含手续费）。
+		closePx, pxSource := currentPrice, "市价估算"
+		if closeOrder != nil && closeOrder.AvgFillPrice > 0 {
+			closePx, pxSource = closeOrder.AvgFillPrice, "成交均价"
+		}
+		pnl := (closePx - p.EntryPrice) * p.Quantity
+		if p.PositionSide == exchange.PositionShort {
+			pnl = -pnl
+		}
+		t.engine.AddRealizedPnL(pnl)
+		_ = m.st.LogEvent(t.Symbol, "force_close", fmt.Sprintf(
+			"强平盈亏已计入已实现盈亏：成本=%.4f 平仓价=%.4f（%s）数量=%.6f 盈亏=%.4f",
+			p.EntryPrice, closePx, pxSource, p.Quantity, pnl), time.Now())
 
 		t.mu.Lock()
 		t.peakPnLPct[p.PositionSide] = 0
@@ -613,11 +630,16 @@ func (m *Manager) Snapshot(ctx context.Context, symbol string) (strategy.Snapsho
 		}
 	}
 	snap := t.engine.Snapshot(price)
+	if snap.StopLossPct <= 0 {
+		// 没有单独配置的网格（含旧配置）：显示风控引擎实际在用的默认止损线
+		snap.StopLossPct = m.rk.DefaultStopLossPct()
+	}
 	if !t.running {
 		// 网格没有运行时，"当前使用的杠杆倍数"这个说法本身就没有意义——
 		// 配置里存的杠杆值跟"现在实际生效"是两回事，显示成0而不是配置里
 		// 的旧值，避免让人以为一个没在跑的网格还在按某个杠杆承担风险。
 		snap.Leverage = 0
+		snap.StopLossPct = 0
 	}
 	return snap, true
 }
